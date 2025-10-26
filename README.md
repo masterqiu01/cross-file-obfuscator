@@ -182,8 +182,6 @@ go build -o cross-file-obfuscator cmd/obfuscator/main.go
 # 多入口项目（main在子目录）- 必须指定 -entry
 ./cross-file-obfuscator -auto -entry "./cmd/server" -output-bin server ./my-project
 
-# 自动模式 + 第三方包混淆（谨慎使用）
-./cross-file-obfuscator -auto -obfuscate-third-party -output-bin myapp ./my-project
 ```
 
 #### 链接器混淆示例

@@ -183,8 +183,6 @@ go build -o cross-file-obfuscator cmd/obfuscator/main.go
 # Multi-entry project (main in subdirectory) - Must specify -entry
 ./cross-file-obfuscator -auto -entry "./cmd/server" -output-bin server ./my-project
 
-# Auto mode + third-party package obfuscation (use cautiously)
-./cross-file-obfuscator -auto -obfuscate-third-party -output-bin myapp ./my-project
 ```
 
 #### Linker Obfuscation Examples
