@@ -827,7 +827,6 @@ func (o *Obfuscator) obfuscateFile(filePath string) error {
 
 	// 字符串加密
 	if o.Config.EncryptStrings {
-		packageName := node.Name.Name
 		hadEncryption := o.encryptStringsInAST(node)
 
 		// 检查文件是否有平台专用的 build tags
@@ -835,7 +834,8 @@ func (o *Obfuscator) obfuscateFile(filePath string) error {
 
 		// ✅ 修复：所有包都应该检查是否已添加解密函数
 		// 之前main包的特殊逻辑会导致每个main文件都添加解密函数，导致redeclared错误
-		shouldAddDecryptFunc := hadEncryption && !o.decryptFuncAdded[packageName] && !hasPlatformBuildTag
+		packagePath := filepath.Dir(filePath)
+		shouldAddDecryptFunc := hadEncryption && !o.decryptFuncAdded[packagePath] && !hasPlatformBuildTag
 
 		if shouldAddDecryptFunc {
 			// 确保有 base64 导入
@@ -856,7 +856,7 @@ func (o *Obfuscator) obfuscateFile(filePath string) error {
 			decryptFunc := o.generateDecryptFunction(base64Alias)
 			source = source + "\n" + decryptFunc
 
-			o.decryptFuncAdded[packageName] = true
+			o.decryptFuncAdded[packagePath] = true
 		}
 
 		// 加密字符串字面量
@@ -938,7 +938,6 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 
 	// 字符串加密
 	if o.Config.EncryptStrings {
-		packageName := node.Name.Name
 		hadEncryption := o.encryptStringsInAST(node)
 
 		// 检查文件是否有平台专用的 build tags
@@ -946,7 +945,8 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 
 		// ✅ 修复：所有包都应该检查是否已添加解密函数
 		// 之前main包的特殊逻辑会导致每个main文件都添加解密函数，导致redeclared错误
-		shouldAddDecryptFunc := hadEncryption && !o.decryptFuncAdded[packageName] && !hasPlatformBuildTag
+		packagePath := filepath.Dir(filePath)
+		shouldAddDecryptFunc := hadEncryption && !o.decryptFuncAdded[packagePath] && !hasPlatformBuildTag
 
 		if shouldAddDecryptFunc {
 			// 确保有 base64 导入
@@ -967,7 +967,7 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 			decryptFunc := o.generateDecryptFunction(base64Alias)
 			source = source + "\n" + decryptFunc
 
-			o.decryptFuncAdded[packageName] = true
+			o.decryptFuncAdded[packagePath] = true
 		}
 
 		// 加密字符串字面量

@@ -39,7 +39,7 @@ type Obfuscator struct {
 
 	// 字符串加密追踪
 	encryptedStrings map[string]bool
-	decryptFuncAdded map[string]bool
+	decryptFuncAdded map[string]bool // 键为包的完整路径，用于多入口项目
 	decryptFuncName  string
 
 	// 作用域分析
