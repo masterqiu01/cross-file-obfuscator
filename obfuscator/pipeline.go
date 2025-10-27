@@ -17,6 +17,17 @@ import (
 
 // Run 执行整个混淆流程
 func (o *Obfuscator) Run() error {
+	// 如果启用了字符串加密，创建解密包并保护相关名称
+	if o.Config.EncryptStrings {
+		// 提前保护解密函数名称和包名
+		o.protectedNames[o.decryptFuncName] = true
+		o.packageNames[o.decryptPkgName] = true
+		
+		if err := o.createDecryptPackage(); err != nil {
+			return fmt.Errorf("创建解密包失败: %v", err)
+		}
+	}
+
 	log.Println("阶段 0/5: 收集导入信息...")
 	if err := o.collectImportInfo(); err != nil {
 		return fmt.Errorf("收集导入信息失败: %v", err)
@@ -84,6 +95,7 @@ func (o *Obfuscator) Run() error {
 	}
 
 	log.Println("阶段 5/5: 应用混淆...")
+	// 第一遍：只处理非平台特定的文件（优先添加解密函数）
 	err = filepath.Walk(o.outputDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -99,15 +111,46 @@ func (o *Obfuscator) Run() error {
 			return nil
 		}
 
-		// 应用混淆（传递原始文件路径）
-		if err := o.obfuscateFileWithMapping(path, fileMapping); err != nil {
-			return fmt.Errorf("混淆文件 %s 失败: %v", path, err)
+		// 只处理非平台特定的文件
+		if !o.isFilePlatformSpecific(path) {
+			if err := o.obfuscateFileWithMapping(path, fileMapping); err != nil {
+				return fmt.Errorf("混淆文件 %s 失败: %v", path, err)
+			}
 		}
 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("应用混淆失败: %v", err)
+		return fmt.Errorf("应用混淆失败（第一遍）: %v", err)
+	}
+
+	// 第二遍：处理平台特定的文件（如果包还没有解密函数，在第一个遇到的文件中添加）
+	err = filepath.Walk(o.outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+
+		// 检查是否跳过文件
+		relPath, _ := filepath.Rel(o.outputDir, path)
+		originalPath := filepath.Join(o.projectRoot, relPath)
+		if _, skipped := o.skippedFiles[originalPath]; skipped {
+			return nil
+		}
+
+		// 只处理平台特定的文件
+		if o.isFilePlatformSpecific(path) {
+			if err := o.obfuscateFileWithMapping(path, fileMapping); err != nil {
+				return fmt.Errorf("混淆文件 %s 失败: %v", path, err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("应用混淆失败（第二遍）: %v", err)
 	}
 
 	return nil
@@ -829,38 +872,13 @@ func (o *Obfuscator) obfuscateFile(filePath string) error {
 	if o.Config.EncryptStrings {
 		hadEncryption := o.encryptStringsInAST(node)
 
-		// 检查文件是否有平台专用的 build tags
-		hasPlatformBuildTag := o.hasPlatformSpecificBuildTag(node)
-
-		// ✅ 修复：所有包都应该检查是否已添加解密函数
-		// 之前main包的特殊逻辑会导致每个main文件都添加解密函数，导致redeclared错误
-		packagePath := filepath.Dir(filePath)
-		shouldAddDecryptFunc := hadEncryption && !o.decryptFuncAdded[packagePath] && !hasPlatformBuildTag
-
-		if shouldAddDecryptFunc {
-			// 确保有 base64 导入
-			source = o.ensureBase64ImportInSource(source)
-
-			// 获取 base64 别名
-			base64Alias := "base64"
-			for _, imp := range node.Imports {
-				if imp.Path != nil && strings.Trim(imp.Path.Value, `"`) == "encoding/base64" {
-					if imp.Name != nil {
-						base64Alias = imp.Name.Name
-					}
-					break
-				}
-			}
-
-			// 添加解密函数
-			decryptFunc := o.generateDecryptFunction(base64Alias)
-			source = source + "\n" + decryptFunc
-
-			o.decryptFuncAdded[packagePath] = true
+		if hadEncryption {
+			// 确保导入解密包
+			source = o.ensureDecryptPackageImport(source)
+			
+			// 加密字符串字面量（使用解密包的函数）
+			source, _ = o.encryptStringsInSourceWithPackage(source)
 		}
-
-		// 加密字符串字面量
-		source, _ = o.encryptStringsInSource(source)
 	}
 
 	// 写回文件
@@ -940,38 +958,13 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 	if o.Config.EncryptStrings {
 		hadEncryption := o.encryptStringsInAST(node)
 
-		// 检查文件是否有平台专用的 build tags
-		hasPlatformBuildTag := o.hasPlatformSpecificBuildTag(node)
-
-		// ✅ 修复：所有包都应该检查是否已添加解密函数
-		// 之前main包的特殊逻辑会导致每个main文件都添加解密函数，导致redeclared错误
-		packagePath := filepath.Dir(filePath)
-		shouldAddDecryptFunc := hadEncryption && !o.decryptFuncAdded[packagePath] && !hasPlatformBuildTag
-
-		if shouldAddDecryptFunc {
-			// 确保有 base64 导入
-			source = o.ensureBase64ImportInSource(source)
-
-			// 获取 base64 别名
-			base64Alias := "base64"
-			for _, imp := range node.Imports {
-				if imp.Path != nil && strings.Trim(imp.Path.Value, `"`) == "encoding/base64" {
-					if imp.Name != nil {
-						base64Alias = imp.Name.Name
-					}
-					break
-				}
-			}
-
-			// 添加解密函数
-			decryptFunc := o.generateDecryptFunction(base64Alias)
-			source = source + "\n" + decryptFunc
-
-			o.decryptFuncAdded[packagePath] = true
+		if hadEncryption {
+			// 确保导入解密包
+			source = o.ensureDecryptPackageImport(source)
+			
+			// 加密字符串字面量（使用解密包的函数）
+			source, _ = o.encryptStringsInSourceWithPackage(source)
 		}
-
-		// 加密字符串字面量
-		source, _ = o.encryptStringsInSource(source)
 	}
 
 	// 写回文件
@@ -1388,7 +1381,7 @@ func (o *Obfuscator) shouldKeepComment(text string) bool {
 		strings.HasPrefix(text, "//+build")
 }
 
-// hasPlatformSpecificBuildTag 检查文件是否有平台专用的 build tag
+// hasPlatformSpecificBuildTag 检查文件是否有平台专用的 build tag 或文件名后缀
 func (o *Obfuscator) hasPlatformSpecificBuildTag(node *ast.File) bool {
 	// 平台关键词列表
 	platformKeywords := []string{
@@ -1412,6 +1405,50 @@ func (o *Obfuscator) hasPlatformSpecificBuildTag(node *ast.File) bool {
 					}
 				}
 			}
+		}
+	}
+	
+	return false
+}
+
+// isFilePlatformSpecific 检查文件是否平台特定（通过文件名后缀或build tag）
+func (o *Obfuscator) isFilePlatformSpecific(filePath string) bool {
+	// 检查文件名后缀
+	if o.hasPlatformSpecificSuffix(filePath) {
+		return true
+	}
+	
+	// 检查build tag（需要解析文件）
+	node, err := parser.ParseFile(o.fset, filePath, nil, parser.ParseComments)
+	if err != nil {
+		return false // 解析失败，假设不是平台特定的
+	}
+	
+	return o.hasPlatformSpecificBuildTag(node)
+}
+
+// hasPlatformSpecificSuffix 检查文件名是否有平台专用的后缀
+func (o *Obfuscator) hasPlatformSpecificSuffix(filePath string) bool {
+	// 获取文件名（不含扩展名）
+	base := filepath.Base(filePath)
+	nameWithoutExt := strings.TrimSuffix(base, ".go")
+	
+	// 平台后缀列表
+	platformSuffixes := []string{
+		"_windows", "_linux", "_darwin", "_freebsd", "_openbsd",
+		"_netbsd", "_dragonfly", "_solaris", "_android", "_aix",
+		"_386", "_amd64", "_arm", "_arm64", "_mips", "_mips64",
+		"_ppc64", "_ppc64le", "_s390x", "_wasm",
+		// 组合后缀，如 _linux_amd64
+		"_windows_amd64", "_windows_386", "_windows_arm", "_windows_arm64",
+		"_linux_amd64", "_linux_386", "_linux_arm", "_linux_arm64",
+		"_darwin_amd64", "_darwin_arm64",
+	}
+	
+	// 检查文件名是否以任何平台后缀结尾
+	for _, suffix := range platformSuffixes {
+		if strings.HasSuffix(nameWithoutExt, suffix) {
+			return true
 		}
 	}
 	
@@ -1584,6 +1621,233 @@ func (o *Obfuscator) encryptStringsInSource(source string) (string, bool) {
 							if len(strContent) > 2 && !strings.Contains(strContent, "\\") {
 								encrypted := o.encryptString(strContent)
 								replacement := fmt.Sprintf(`%s("%s")`, o.decryptFuncName, encrypted)
+								newLine = strings.Replace(newLine, strWithQuotes, replacement, 1)
+								hadEncryption = true
+							}
+						}
+					}
+					stringStart = -1
+				}
+			}
+		}
+
+		result[i] = newLine
+	}
+
+	return strings.Join(result, "\n"), hadEncryption
+}
+
+// createDecryptPackage 创建独立的解密包
+func (o *Obfuscator) createDecryptPackage() error {
+	if o.decryptPkgCreated {
+		return nil
+	}
+
+	// 设置解密包路径（在项目根目录下）
+	decryptPkgDir := filepath.Join(o.projectRoot, o.decryptPkgName)
+	if err := os.MkdirAll(decryptPkgDir, 0755); err != nil {
+		return fmt.Errorf("创建解密包目录失败: %v", err)
+	}
+
+	// 生成解密包的内容
+	keyBytes := []byte(o.encryptionKey)
+	keyLiteral := "[]byte{"
+	for i, b := range keyBytes {
+		if i > 0 {
+			keyLiteral += ", "
+		}
+		keyLiteral += fmt.Sprintf("%d", b)
+	}
+	keyLiteral += "}"
+
+	// 创建解密包文件（不包含任何暴露用途的注释）
+	decryptFileContent := fmt.Sprintf(`package %s
+
+import "encoding/base64"
+
+func %s(s string) string {
+	d, e := base64.StdEncoding.DecodeString(s)
+	if e != nil {
+		return ""
+	}
+	k := %s
+	r := make([]byte, len(d))
+	for i, b := range d {
+		r[i] = b ^ k[i%%len(k)]
+	}
+	return string(r)
+}
+`, o.decryptPkgName, o.decryptFuncName, keyLiteral)
+
+	// 写入文件（使用随机文件名）
+	randomFileName := fmt.Sprintf("%s.go", generateRandomString(10))
+	decryptFilePath := filepath.Join(decryptPkgDir, randomFileName)
+	if err := ioutil.WriteFile(decryptFilePath, []byte(decryptFileContent), 0644); err != nil {
+		return fmt.Errorf("写入解密文件失败: %v", err)
+	}
+
+	// 读取go.mod获取模块名
+	goModPath := filepath.Join(o.projectRoot, "go.mod")
+	goModContent, err := ioutil.ReadFile(goModPath)
+	if err != nil {
+		return fmt.Errorf("读取go.mod失败: %v", err)
+	}
+
+	// 解析模块名
+	moduleName := ""
+	lines := strings.Split(string(goModContent), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "module ") {
+			moduleName = strings.TrimSpace(strings.TrimPrefix(line, "module"))
+			break
+		}
+	}
+
+	if moduleName == "" {
+		return fmt.Errorf("无法从go.mod中获取模块名")
+	}
+
+	// 设置解密包的导入路径
+	o.decryptPkgPath = moduleName + "/" + o.decryptPkgName
+	o.decryptPkgCreated = true
+
+	// 保护解密函数名称和包名，防止被混淆
+	o.protectedNames[o.decryptFuncName] = true
+	o.packageNames[o.decryptPkgName] = true
+
+	log.Printf("✅ 创建解密包: %s (导入路径: %s, 函数名: %s)", decryptPkgDir, o.decryptPkgPath, o.decryptFuncName)
+	return nil
+}
+
+// ensureDecryptPackageImport 确保源代码中导入了解密包
+func (o *Obfuscator) ensureDecryptPackageImport(source string) string {
+	importLine := fmt.Sprintf(`%s "%s"`, o.decryptPkgName, o.decryptPkgPath)
+	
+	// 检查是否已经导入
+	if strings.Contains(source, o.decryptPkgPath) {
+		return source
+	}
+
+	lines := strings.Split(source, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "import (") {
+			// 在 import 块中添加
+			lines[i] = line + "\n\t" + importLine
+			return strings.Join(lines, "\n")
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "import ") {
+			// 单行 import，转换为块
+			lines[i] = "import (\n\t" + importLine + "\n" + strings.TrimPrefix(line, "import ") + "\n)"
+			return strings.Join(lines, "\n")
+		}
+	}
+
+	// 没有找到 import，在 package 后添加
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "package ") {
+			lines = append(lines[:i+1], append([]string{"\nimport " + importLine + "\n"}, lines[i+1:]...)...)
+			return strings.Join(lines, "\n")
+		}
+	}
+
+	return source
+}
+
+// encryptStringsInSourceWithPackage 在源代码中加密字符串（使用解密包）
+func (o *Obfuscator) encryptStringsInSourceWithPackage(source string) (string, bool) {
+	lines := strings.Split(source, "\n")
+	result := make([]string, len(lines))
+
+	hadEncryption := false
+	inImportBlock := false
+	inConstBlock := false
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// 跟踪 import 块
+		if strings.HasPrefix(trimmed, "import (") {
+			inImportBlock = true
+			result[i] = line
+			continue
+		}
+		if inImportBlock && trimmed == ")" {
+			inImportBlock = false
+			result[i] = line
+			continue
+		}
+
+		// 跟踪 const 块
+		if strings.HasPrefix(trimmed, "const (") {
+			inConstBlock = true
+			result[i] = line
+			continue
+		}
+		if inConstBlock && trimmed == ")" {
+			inConstBlock = false
+			result[i] = line
+			continue
+		}
+
+		// 跳过特殊行
+		if inImportBlock || inConstBlock || strings.Contains(trimmed, "package ") ||
+			strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "const ") {
+			result[i] = line
+			continue
+		}
+
+		// 跳过结构体标签
+		if strings.Contains(line, "`") && strings.Contains(line, ":") {
+			result[i] = line
+			continue
+		}
+
+		// 处理行
+		newLine := line
+		inString := false
+		inRune := false
+		escaped := false
+		stringStart := -1
+
+		for j := 0; j < len(line); j++ {
+			ch := line[j]
+
+			if escaped {
+				escaped = false
+				continue
+			}
+
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+
+			// 处理单引号（rune）
+			if ch == '\'' && !inString {
+				if !inRune {
+					inRune = true
+				} else {
+					inRune = false
+				}
+				continue
+			}
+
+			// 只处理双引号
+			if ch == '"' && !inRune {
+				if !inString {
+					inString = true
+					stringStart = j
+				} else {
+					inString = false
+					if stringStart >= 0 {
+						strWithQuotes := line[stringStart : j+1]
+						if len(strWithQuotes) > 4 {
+							strContent := strWithQuotes[1 : len(strWithQuotes)-1]
+							if len(strContent) > 2 && !strings.Contains(strContent, "\\") {
+								encrypted := o.encryptString(strContent)
+								// 使用解密包的函数: pkgName.FuncName("encrypted")
+								replacement := fmt.Sprintf(`%s.%s("%s")`, o.decryptPkgName, o.decryptFuncName, encrypted)
 								newLine = strings.Replace(newLine, strWithQuotes, replacement, 1)
 								hadEncryption = true
 							}

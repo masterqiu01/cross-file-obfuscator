@@ -24,7 +24,9 @@ func New(projectRoot, outputDir string, config *Config) *Obfuscator {
 
 	seed, _ := rand.Int(rand.Reader, big.NewInt(999999))
 	encryptionKey := generateRandomString(64)
-	decryptFuncName := fmt.Sprintf("fn%s", generateRandomString(10))
+	// 生成完全随机的导出函数名（首字母大写）
+	decryptFuncName := fmt.Sprintf("%c%s", 'A'+byte(seed.Int64()%26), generateRandomString(11))
+	decryptPkgName := fmt.Sprintf("p%s", generateRandomString(8))
 
 	return &Obfuscator{
 		varMapping:          make(map[string]string),
@@ -46,6 +48,8 @@ func New(projectRoot, outputDir string, config *Config) *Obfuscator {
 		encryptedStrings:    make(map[string]bool),
 		decryptFuncAdded:    make(map[string]bool),
 		decryptFuncName:     decryptFuncName,
+		decryptPkgName:      decryptPkgName,
+		decryptPkgCreated:   false,
 		skippedFiles:        make(map[string]string),
 		reflectionPackages:  make(map[string]bool),
 		fileScopes:          make(map[string]*ScopeAnalyzer),

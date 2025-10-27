@@ -41,6 +41,9 @@ type Obfuscator struct {
 	encryptedStrings map[string]bool
 	decryptFuncAdded map[string]bool // 键为包的完整路径，用于多入口项目
 	decryptFuncName  string
+	decryptPkgName   string          // 解密包的名称
+	decryptPkgPath   string          // 解密包的导入路径
+	decryptPkgCreated bool           // 是否已创建解密包
 
 	// 作用域分析
 	fileScopes       map[string]*ScopeAnalyzer // 文件路径 -> 作用域分析器
