@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 
 	"cross-file-obfuscator/obfuscator"
@@ -72,6 +73,8 @@ func printUsage() {
 	fmt.Println("  -pkg-replace string         包名替换映射 (格式: 'pkg1=a,pkg2=b')")
 	fmt.Println("  -auto-discover-pkgs         自动发现并替换项目中的所有包名")
 	fmt.Println("  -obfuscate-third-party      混淆第三方依赖包 (谨慎使用)")
+	fmt.Println("  -only-project               只混淆项目包，保留标准库 (最小化 pclntab)")
+	fmt.Println("  -disable-pclntab            完全禁用 pclntab 修改 (最安全)")
 	fmt.Println("  -auto                       自动模式：全功能混淆 + 自动编译 (推荐!)")
 	fmt.Println()
 	fmt.Println("示例:")
@@ -113,13 +116,15 @@ func main() {
 
 	// 高级选项
 	var (
-		buildWithLinker     = flag.Bool("build-with-linker", false, "直接编译并应用链接器混淆")
-		outputBinary        = flag.String("output-bin", "", "输出二进制文件名 (配合 -build-with-linker 使用)")
-		entryPackage        = flag.String("entry", ".", "入口包路径，例如: './cmd/server' ")
-		packageReplacements = flag.String("pkg-replace", "", "包名替换映射 (格式: 'original1=new1,original2=new2')")
-		autoDiscoverPkgs    = flag.Bool("auto-discover-pkgs", false, "自动发现并替换项目中的所有包名")
-		obfuscateThirdParty = flag.Bool("obfuscate-third-party", false, "混淆第三方依赖包（谨慎使用）")
-		autoMode            = flag.Bool("auto", false, "自动模式：全功能混淆 + 自动编译（包含所有混淆功能）")
+		buildWithLinker      = flag.Bool("build-with-linker", false, "直接编译并应用链接器混淆")
+		outputBinary         = flag.String("output-bin", "", "输出二进制文件名 (配合 -build-with-linker 使用)")
+		entryPackage         = flag.String("entry", ".", "入口包路径，例如: './cmd/server' ")
+		packageReplacements  = flag.String("pkg-replace", "", "包名替换映射 (格式: 'original1=new1,original2=new2')")
+		autoDiscoverPkgs     = flag.Bool("auto-discover-pkgs", false, "自动发现并替换项目中的所有包名")
+		obfuscateThirdParty  = flag.Bool("obfuscate-third-party", false, "混淆第三方依赖包（谨慎使用）")
+		onlyObfuscateProject = flag.Bool("only-project", false, "只混淆项目包，保留标准库（最小化 pclntab，推荐 Windows）")
+		disablePclntab       = flag.Bool("disable-pclntab", false, "完全禁用 pclntab 修改（最安全但保护较弱）")
+		autoMode             = flag.Bool("auto", false, "自动模式：全功能混淆 + 自动编译（Windows 下自动使用最小化 pclntab）")
 	)
 
 	// 自定义 Usage 函数
@@ -209,11 +214,46 @@ func main() {
 			binName = "output_obfuscated"
 		}
 
+		// 检测目标平台，智能选择 pclntab 混淆策略
+		targetOS := os.Getenv("GOOS")
+		if targetOS == "" {
+			targetOS = runtime.GOOS
+		}
+		
+		isWindows := (targetOS == "windows")
+		
+		fmt.Println()
+		if isWindows {
+			fmt.Println("⚠️  检测到目标平台为 Windows")
+			fmt.Println("   为避免杀软误报，已自动启用最小化 pclntab 混淆")
+			fmt.Println("   - 只混淆项目包（~772 个函数，-86%）")
+			fmt.Println("   - 保留所有标准库（runtime.*, sync.*, fmt.* 等）")
+			fmt.Println("   - 仍保留：字符串加密、垃圾代码、符号表移除")
+			fmt.Println()
+			fmt.Println("   💡 如需更安全的方案，可使用:")
+			fmt.Println("      ./main -build-with-linker -auto-discover-pkgs -disable-pclntab \\")
+			fmt.Println("        --output-bin app.exe -entry <入口> <项目>")
+		} else {
+			fmt.Println("⚠️  检测到目标平台为", targetOS)
+			fmt.Println("   已启用完整 pclntab 混淆（最强保护）")
+			fmt.Println("   - 混淆所有包（标准库 + 项目包）")
+			fmt.Println("   - 修改 ~5000+ 个函数名")
+			fmt.Println()
+			fmt.Println("   💡 如被杀软识别，可切换为:")
+			fmt.Println("      方案1 (最小化): ./main -build-with-linker -auto-discover-pkgs \\")
+			fmt.Println("        -only-project --output-bin app -entry <入口> <项目>")
+			fmt.Println("      方案2 (完全禁用): ./main -build-with-linker -auto-discover-pkgs \\")
+			fmt.Println("        -disable-pclntab --output-bin app -entry <入口> <项目>")
+		}
+		fmt.Println()
+
 		linkConfig := &obfuscator.LinkConfig{
 			RemoveFuncNames:      true,
 			EntryPackage:         *entryPackage,
 			AutoDiscoverPackages: true,
-			ObfuscateThirdParty:  true, // auto 模式自动启用第三方包混淆
+			ObfuscateThirdParty:  false,     // AUTO 模式不混淆第三方包
+			OnlyObfuscateProject: isWindows, // ⭐ Windows: 最小化，其他: 完整
+			DisablePclntab:       false,     // 不完全禁用
 		}
 
 		linkerObf := obfuscator.NewLinkerObfuscator(outDir, binName, linkConfig)
@@ -265,11 +305,13 @@ func main() {
 
 		// 创建链接器混淆器
 		linkConfig := &obfuscator.LinkConfig{
-			RemoveFuncNames:      true,                 // 混淆函数名
-			EntryPackage:         *entryPackage,        // 入口包路径
-			PackageReplacements:  pkgReplaceMap,        // 包名替换映射
-			AutoDiscoverPackages: *autoDiscoverPkgs,    // 自动发现包名
-			ObfuscateThirdParty:  *obfuscateThirdParty, // 混淆第三方包
+			RemoveFuncNames:      true,                  // 混淆函数名
+			EntryPackage:         *entryPackage,         // 入口包路径
+			PackageReplacements:  pkgReplaceMap,         // 包名替换映射
+			AutoDiscoverPackages: *autoDiscoverPkgs,     // 自动发现包名
+			ObfuscateThirdParty:  *obfuscateThirdParty,  // 混淆第三方包
+			OnlyObfuscateProject: *onlyObfuscateProject, // 只混淆项目包
+			DisablePclntab:       *disablePclntab,       // 完全禁用 pclntab
 		}
 
 		linkerObf := obfuscator.NewLinkerObfuscator(projectRoot, binName, linkConfig)

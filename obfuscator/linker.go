@@ -81,9 +81,7 @@ func (lo *LinkerObfuscator) BuildWithLinkerObfuscation() error {
 	// 使用 -ldflags="-s -w" 移除符号表和调试信息
 	// -s: 禁用符号表
 	// -w: 禁用 DWARF 调试信息
-	// 这样可以减小二进制大小并增强混淆效果
-	// 注意：-ldflags 和 "-s -w" 必须分成两个参数
-	buildArgs := []string{"build", "-ldflags", "-s -w", "-trimpath", "-o", outputPath}
+	buildArgs := []string{"build", "-ldflags=-s -w", "-trimpath", "-o", outputPath}
 	
 	// 添加入口包路径
 	buildArgs = append(buildArgs, lo.config.EntryPackage)
@@ -119,7 +117,7 @@ func (lo *LinkerObfuscator) BuildWithLinkerObfuscation() error {
 	return nil
 }
 
-// postProcessBinary 后处理二进制文件 - 真正的实现
+// postProcessBinary 后处理二进制文件
 func (lo *LinkerObfuscator) postProcessBinary() error {
 	data, err := os.ReadFile(lo.outputBin)
 	if err != nil {
@@ -169,17 +167,6 @@ func (lo *LinkerObfuscator) postProcessBinary() error {
 	return nil
 }
 
-// stripBinary 已废弃 - 现在在编译时使用 -ldflags="-s -w" 直接移除符号表
-// 保留此函数以供将来可能的自定义需求
-func (lo *LinkerObfuscator) stripBinary() error {
-	// 注意：此函数已不再使用，因为我们在 BuildWithLinkerObfuscation 中
-	// 直接使用 -ldflags="-s -w" 编译，这是跨平台的最佳方案
-	
-	// 如果将来需要额外的 strip 操作，可以在这里实现
-	// 但目前 -ldflags="-s -w" 已经足够了
-	
-	return nil
-}
 
 // detectBinaryFormat 检测二进制文件格式
 func detectBinaryFormat(data []byte) string {
@@ -364,6 +351,12 @@ func (lo *LinkerObfuscator) modifyPclntab(data []byte, offset int64) ([]byte, bo
 	originalMagic := binary.LittleEndian.Uint32(newData[offset : offset+4])
 	fmt.Printf("   原始 magic value: 0x%08x\n", originalMagic)
 	
+	// 检查是否完全禁用 pclntab 修改
+	if lo.config.DisablePclntab {
+		fmt.Printf("   ⚠️  pclntab 修改已禁用（避免杀软误报）\n")
+		return data, false, nil
+	}
+	
 	// 混淆函数名
 	if lo.config.RemoveFuncNames {
 		if err := lo.obfuscateFunctionNames(newData, offset); err != nil {
@@ -376,52 +369,109 @@ func (lo *LinkerObfuscator) modifyPclntab(data []byte, offset int64) ([]byte, bo
 	return data, false, nil
 }
 
-// obfuscateFunctionNames 混淆二进制中的函数名
+// obfuscateFunctionNames 混淆二进制中的函数名（使用等长自然混淆）
 func (lo *LinkerObfuscator) obfuscateFunctionNames(data []byte, pclntabOffset int64) error {
 	var patterns []string
 	var replacements []string
 	
+	// 创建自然名称生成器
+	nameGen := NewNaturalNameGenerator()
+	
+	// 标准库包列表
+	standardLibs := map[string]bool{
+		"main": false, "runtime": true, "sync": true, "fmt": true,
+		"os": true, "io": true, "net": true, "http": true,
+		"bufio": true, "bytes": true, "strings": true, "strconv": true,
+		"time": true, "math": true, "errors": true, "context": true,
+		"encoding": true, "json": true, "xml": true, "base64": true,
+		"hex": true, "unicode": true, "regexp": true, "log": true,
+		"sort": true, "path": true, "filepath": true, "syscall": true,
+	}
+	
 	// 如果用户提供了自定义包名替换映射，使用它
 	if len(lo.config.PackageReplacements) > 0 {
-		fmt.Println("   使用自定义包名替换映射:")
+		if lo.config.OnlyObfuscateProject {
+			fmt.Println("   ⚠️  最小化混淆模式：只混淆项目包，保留标准库")
+		} else {
+			fmt.Println("   使用自定义包名替换映射（等长模式）:")
+		}
+		
 		for original, replacement := range lo.config.PackageReplacements {
+			// 检查是否是标准库
+			pkgName := strings.TrimSuffix(original, ".")
+			isStdLib := standardLibs[pkgName]
+			
+			// 如果启用了 OnlyObfuscateProject，跳过标准库
+			if lo.config.OnlyObfuscateProject && isStdLib {
+				continue
+			}
+			
 			// 确保包名以 "." 结尾（用于匹配函数名）
 			originalPattern := original
 			if !strings.HasSuffix(originalPattern, ".") {
 				originalPattern += "."
 			}
+			
+			// 确保替换后的名称与原始名称等长
 			replacementPattern := replacement
 			if !strings.HasSuffix(replacementPattern, ".") {
 				replacementPattern += "."
 			}
 			
+			// 如果长度不同，重新生成等长的名称
+			if len(replacementPattern) != len(originalPattern) {
+				replacementPattern = nameGen.GeneratePackageName(originalPattern, len(originalPattern))
+			}
+			
 			patterns = append(patterns, originalPattern)
 			replacements = append(replacements, replacementPattern)
-			fmt.Printf("     %s -> %s\n", originalPattern, replacementPattern)
-		}
-	} else {
-		// 使用默认的包名替换模式
-		fmt.Println("   使用默认包名替换模式")
-		patterns = []string{
-			"main.",
-			"runtime.",
-			"sync.",
-			"fmt.",
-			"os.",
-			"io.",
-			"net.",
-			"http.",
+			
+			if !lo.config.OnlyObfuscateProject || (lo.config.OnlyObfuscateProject && !isStdLib) {
+				fmt.Printf("     %s -> %s (均为 %d 字节)\n", originalPattern, replacementPattern, len(originalPattern))
+			}
 		}
 		
-		replacements = []string{
-			"a.",
-			"b.",
-			"c.",
-			"d.",
-			"e.",
-			"f.",
-			"g.",
-			"h.",
+		if lo.config.OnlyObfuscateProject {
+			fmt.Printf("   ✅ 已过滤标准库，只混淆项目包（共 %d 个）\n", len(patterns))
+		}
+	} else {
+		// 使用默认的包名替换模式（等长自然混淆）
+		if lo.config.OnlyObfuscateProject {
+			fmt.Println("   ⚠️  最小化混淆模式：只混淆项目包，保留标准库（减少杀软误报）")
+			// 只混淆 main 包，保留所有标准库
+			defaultPatterns := []string{
+				"main.",
+			}
+			
+			for _, pattern := range defaultPatterns {
+				replacement := nameGen.GeneratePackageName(pattern, len(pattern))
+				patterns = append(patterns, pattern)
+				replacements = append(replacements, replacement)
+			}
+		} else {
+			fmt.Println("   使用等长自然混淆模式（标准）")
+			defaultPatterns := []string{
+				"main.",
+				"runtime.",
+				"sync.",
+				"fmt.",
+				"os.",
+				"io.",
+				"net.",
+				"http.",
+			}
+			
+			for _, pattern := range defaultPatterns {
+				// 生成等长的自然名称
+				replacement := nameGen.GeneratePackageName(pattern, len(pattern))
+				patterns = append(patterns, pattern)
+				replacements = append(replacements, replacement)
+			}
+		}
+		
+		fmt.Println("   等长替换映射:")
+		for i, pattern := range patterns {
+			fmt.Printf("     %s -> %s\n", pattern, replacements[i])
 		}
 	}
 	
@@ -456,16 +506,21 @@ func (lo *LinkerObfuscator) obfuscateFunctionNames(data []byte, pclntabOffset in
 					continue
 				}
 				
-				// 只有当替换字符串不长于原字符串时才替换
-				if len(replacement) <= len(patternBytes) {
+				// ⭐ 等长替换：确保替换字符串与原字符串长度完全相同
+				if len(replacement) == len(patternBytes) {
+					// 直接替换，无需填充
 					copy(data[j:j+len(replacement)], replacement)
-					// 用空字节填充剩余部分
-					for k := j + len(replacement); k < j+len(patternBytes); k++ {
-						data[k] = 0
-					}
+					count++
+					patternCount++
+				} else if len(replacement) < len(patternBytes) {
+					// 如果替换字符串较短（不应该发生，但作为保护）
+					// 使用原始字符串填充方式而不是 0x00
+					copy(data[j:j+len(replacement)], replacement)
+					// 不填充，保持原有字符（更安全）
 					count++
 					patternCount++
 				}
+				// 忽略替换字符串过长的情况
 			}
 		}
 		
@@ -606,187 +661,9 @@ func (lo *LinkerObfuscator) isSafePackagePathReplacement(data []byte, pos int, l
 	return true
 }
 
-// replaceProjectPackagePathsInPclntab 只在 pclntab 区域内替换项目包路径（安全版本）
-// 已弃用：使用 replaceProjectPackagePathsGlobal 代替
-func (lo *LinkerObfuscator) replaceProjectPackagePathsInPclntab(data []byte, pclntabOffset int64, pclntabEnd int) int {
-	if len(lo.config.PackageReplacements) == 0 {
-		return 0
-	}
-	
-	count := 0
-	replacedPaths := make(map[string]int)
-	
-	// 标准库包名列表（这些不进行路径替换，只替换函数名前缀）
-	standardLibs := map[string]bool{
-		"main": true, "runtime": true, "sync": true, "fmt": true,
-		"os": true, "io": true, "net": true, "http": true,
-		"bufio": true, "bytes": true, "strings": true, "strconv": true,
-		"time": true, "math": true, "errors": true, "context": true,
-		"encoding": true, "json": true, "xml": true, "base64": true,
-		"hex": true, "unicode": true, "regexp": true, "log": true,
-		"sort": true, "path": true, "filepath": true, "syscall": true,
-	}
-	
-	// 对每个包路径进行替换
-	for original, replacement := range lo.config.PackageReplacements {
-		// 移除尾部的 "." 如果有的话
-		originalPath := strings.TrimSuffix(original, ".")
-		
-		// 跳过标准库包（标准库包名太短，可能误替换系统符号）
-		if standardLibs[originalPath] {
-			continue
-		}
-		
-		// 只替换包含 "/" 的路径（项目包路径）
-		// 这样可以避免替换单个单词，减少误替换风险
-		if !strings.Contains(originalPath, "/") {
-			continue
-		}
-		
-		replacementPath := strings.TrimSuffix(replacement, ".")
-		patternBytes := []byte(originalPath)
-		replacementBytes := []byte(replacementPath)
-		
-		// 只在 pclntab 区域内替换
-		for j := int(pclntabOffset); j < pclntabEnd-len(patternBytes); j++ {
-			if bytes.Equal(data[j:j+len(patternBytes)], patternBytes) {
-				// 只有当替换字符串不长于原字符串时才替换
-				if len(replacementBytes) <= len(patternBytes) {
-					copy(data[j:j+len(replacementBytes)], replacementBytes)
-					// 用空字节填充剩余部分
-					for k := j + len(replacementBytes); k < j + len(patternBytes); k++ {
-						data[k] = 0
-					}
-					count++
-					replacedPaths[originalPath]++
-				}
-			}
-		}
-	}
-	
-	if count > 0 {
-		fmt.Printf("   ✅ 替换了 %d 个包路径:\n", count)
-		for path, cnt := range replacedPaths {
-			fmt.Printf("      %s: %d 次\n", path, cnt)
-		}
-	}
-	
-	return count
-}
 
-// replaceProjectPackagePaths 只替换项目内部的包路径（不替换标准库）
-// 已弃用：使用 replaceProjectPackagePathsInPclntab 代替
-func (lo *LinkerObfuscator) replaceProjectPackagePaths(data []byte) int {
-	if len(lo.config.PackageReplacements) == 0 {
-		return 0
-	}
-	
-	count := 0
-	
-	// 标准库包名列表（这些不进行路径替换，只替换函数名前缀）
-	standardLibs := map[string]bool{
-		"main":    true,
-		"runtime": true,
-		"sync":    true,
-		"fmt":     true,
-		"os":      true,
-		"io":      true,
-		"net":     true,
-		"http":    true,
-	}
-	
-	// 对每个包路径进行替换
-	for original, replacement := range lo.config.PackageReplacements {
-		// 移除尾部的 "." 如果有的话
-		originalPath := strings.TrimSuffix(original, ".")
-		
-		// 跳过标准库包（标准库包名太短，可能误替换系统符号）
-		if standardLibs[originalPath] {
-			continue
-		}
-		
-		// 只替换包含 "/" 的路径（项目包路径）
-		// 这样可以避免替换单个单词，减少误替换风险
-		if !strings.Contains(originalPath, "/") {
-			continue
-		}
-		
-		replacementPath := strings.TrimSuffix(replacement, ".")
-		
-		// 替换包路径本身
-		count += lo.replaceBytesStrict(data, []byte(originalPath), []byte(replacementPath))
-		
-		// 替换带斜杠的路径
-		originalWithSlash := originalPath + "/"
-		replacementWithSlash := replacementPath + "/"
-		count += lo.replaceBytesStrict(data, []byte(originalWithSlash), []byte(replacementWithSlash))
-	}
-	
-	return count
-}
 
-// replacePackagePaths 替换二进制中的包路径信息（如 github.com/user/project/pkg）
-// 已废弃，使用 replaceProjectPackagePaths 代替
-func (lo *LinkerObfuscator) replacePackagePaths(data []byte) int {
-	if len(lo.config.PackageReplacements) == 0 {
-		return 0
-	}
-	
-	count := 0
-	
-	// 对每个包路径进行替换
-	for original, replacement := range lo.config.PackageReplacements {
-		// 移除尾部的 "." 如果有的话
-		originalPath := strings.TrimSuffix(original, ".")
-		replacementPath := strings.TrimSuffix(replacement, ".")
-		
-		// 替换包路径本身（不带斜杠或点）
-		count += lo.replaceBytes(data, []byte(originalPath), []byte(replacementPath))
-		
-		// 替换带斜杠的路径（如 github.com/user/project/）
-		if strings.Contains(originalPath, "/") {
-			originalWithSlash := originalPath + "/"
-			replacementWithSlash := replacementPath + "/"
-			count += lo.replaceBytes(data, []byte(originalWithSlash), []byte(replacementWithSlash))
-		}
-	}
-	
-	return count
-}
-
-// replaceBytes 在数据中查找并替换字节序列
-// 添加安全检查，避免破坏系统路径
-func (lo *LinkerObfuscator) replaceBytes(data []byte, pattern []byte, replacement []byte) int {
-	if len(replacement) > len(pattern) {
-		// 替换字符串不能比原字符串长
-		return 0
-	}
-	
-	count := 0
-	for i := 0; i < len(data)-len(pattern); i++ {
-		if bytes.Equal(data[i:i+len(pattern)], pattern) {
-			// 安全检查：确保不是系统路径的一部分
-			if !lo.isSafeToReplace(data, i, len(pattern)) {
-				continue
-			}
-			
-			// 执行替换
-			copy(data[i:i+len(replacement)], replacement)
-			// 用空字节填充剩余部分
-			for j := i + len(replacement); j < i+len(pattern); j++ {
-				data[j] = 0
-			}
-			count++
-			// 跳过已替换的部分
-			i += len(pattern) - 1
-		}
-	}
-	
-	return count
-}
-
-// replaceBytesStrict 更严格的字节替换，用于包路径替换
-// 比 replaceBytes 有更多的安全检查
+// replaceBytesStrict 严格的字节替换，用于包路径替换
 func (lo *LinkerObfuscator) replaceBytesStrict(data []byte, pattern []byte, replacement []byte) int {
 	if len(replacement) > len(pattern) {
 		return 0

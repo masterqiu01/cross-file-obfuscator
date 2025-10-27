@@ -81,5 +81,7 @@ type LinkConfig struct {
 	PackageReplacements   map[string]string // 自定义包名替换映射，例如: {"github.com/user/project": "a", "main": "m"}
 	AutoDiscoverPackages  bool              // 是否自动发现并替换项目中的所有包名
 	ObfuscateThirdParty   bool              // 是否混淆第三方依赖包（谨慎使用）
+	OnlyObfuscateProject  bool              // 只混淆项目包，不修改标准库（减少杀软误报）⭐ 新增
+	DisablePclntab        bool              // 完全禁用 pclntab 修改（最安全）⭐ 新增
 }
 
