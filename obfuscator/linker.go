@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 )
@@ -79,8 +78,12 @@ func (lo *LinkerObfuscator) BuildWithLinkerObfuscation() error {
 	}
 	
 	// 构建 go build 命令
-	// 编译时不使用 -w -s，我们需要保留符号表以便后续处理
-	buildArgs := []string{"build", "-trimpath", "-o", outputPath}
+	// 使用 -ldflags="-s -w" 移除符号表和调试信息
+	// -s: 禁用符号表
+	// -w: 禁用 DWARF 调试信息
+	// 这样可以减小二进制大小并增强混淆效果
+	// 注意：-ldflags 和 "-s -w" 必须分成两个参数
+	buildArgs := []string{"build", "-ldflags", "-s -w", "-trimpath", "-o", outputPath}
 	
 	// 添加入口包路径
 	buildArgs = append(buildArgs, lo.config.EntryPackage)
@@ -110,13 +113,8 @@ func (lo *LinkerObfuscator) BuildWithLinkerObfuscation() error {
 	}
 	fmt.Println("✅ 后处理完成")
 	
-	// 第三步：使用 strip 移除符号表（可选）
-	fmt.Println("第 3 步: 移除符号表...")
-	if err := lo.stripBinary(); err != nil {
-		fmt.Printf("⚠️  警告: strip 失败: %v\n", err)
-	} else {
-		fmt.Println("✅ 符号表移除完成")
-	}
+	// 注意：由于编译时已使用 -ldflags="-s -w"，无需再执行 strip
+	fmt.Println("✅ 符号表已在编译时移除（-ldflags=\"-s -w\"）")
 	
 	return nil
 }
@@ -171,27 +169,16 @@ func (lo *LinkerObfuscator) postProcessBinary() error {
 	return nil
 }
 
-// stripBinary 使用系统工具移除符号表
+// stripBinary 已废弃 - 现在在编译时使用 -ldflags="-s -w" 直接移除符号表
+// 保留此函数以供将来可能的自定义需求
 func (lo *LinkerObfuscator) stripBinary() error {
-	var cmd *exec.Cmd
+	// 注意：此函数已不再使用，因为我们在 BuildWithLinkerObfuscation 中
+	// 直接使用 -ldflags="-s -w" 编译，这是跨平台的最佳方案
 	
-	switch runtime.GOOS {
-	case "linux", "darwin":
-		cmd = exec.Command("strip", lo.outputBin)
-	case "windows":
-		// Windows 上可以使用 go build -ldflags="-s -w"
-		// 这里我们手动重新编译
-		cmd = exec.Command("go", "build",
-			"-ldflags=-w -s",
-			"-trimpath",
-			"-o", lo.outputBin,
-		)
-		cmd.Dir = lo.projectDir
-	default:
-		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
-	}
+	// 如果将来需要额外的 strip 操作，可以在这里实现
+	// 但目前 -ldflags="-s -w" 已经足够了
 	
-	return cmd.Run()
+	return nil
 }
 
 // detectBinaryFormat 检测二进制文件格式

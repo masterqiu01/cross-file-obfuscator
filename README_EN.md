@@ -156,7 +156,7 @@ go build -o cross-file-obfuscator cmd/obfuscator/main.go
 -output-bin <filename>      Output binary filename (use with -build-with-linker or -auto)
 -entry <package-path>       Entry package path (must specify for multi-entry projects)
                             - Default: "." (root directory)
-                            - Example: "./cmd/server", "./cmd/gost"
+                            - Example: "./cmd/server", "./cmd/xxxxx"
                             - Used to specify main package location
 -pkg-replace <mapping>      Package name replacement mapping (format: 'original1=new1,original2=new2')
 -auto-discover-pkgs         Auto-discover and replace all package names in project (recommended)
@@ -170,7 +170,7 @@ go build -o cross-file-obfuscator cmd/obfuscator/main.go
 - **Common Scenarios**:
   - `main.go` in root → No need to specify
   - `cmd/server/main.go` → Need `-entry "./cmd/server"`
-  - `cmd/gost/main.go` → Need `-entry "./cmd/gost"`
+  - `cmd/xxxxx/main.go` → Need `-entry "./cmd/xxxxx"`
 
 ### Usage Examples
 
@@ -277,12 +277,12 @@ output: current ar archive  # Error: this is archive, not executable
 1. Find main package location:
 ```bash
 find ./project -name "*.go" -exec grep -l "func main()" {} \;
-# Output: ./project/cmd/gost/main.go
+# Output: ./project/cmd/xxxxx/main.go
 ```
 
 2. Add `-entry` parameter:
 ```bash
-./cross-file-obfuscator -auto -entry "./cmd/gost" -output-bin output ./project
+./cross-file-obfuscator -auto -entry "./cmd/xxxxx" -output-bin output ./project
 ```
 
 ---
@@ -503,8 +503,8 @@ Same-name object strategy:
 - Map: All same-name objects use same obfuscated name
 - Reason: Go compiler only compiles matching platform files, no conflicts
 - Example:
-  - gost/sockopts_linux.go:  func setSocketMark() { ... }
-  - gost/sockopts_other.go:  func setSocketMark() { ... }
+  - xxxxx/sockopts_linux.go:  func setSocketMark() { ... }
+  - xxxxx/sockopts_other.go:  func setSocketMark() { ... }
   - Both map to: fnXXXXXXXXXX
 ```
 
@@ -891,13 +891,13 @@ Post-processing failed: unsupported binary format: Unknown
 1. **Find main package location**:
 ```bash
 find ./your-project -name "*.go" -exec grep -l "func main()" {} \;
-# Output example: ./your-project/cmd/gost/main.go
+# Output example: ./your-project/cmd/xxxxx/main.go
 ```
 
 2. **Add `-entry` parameter**:
 ```bash
-# If main in cmd/gost/main.go
-./cross-file-obfuscator -auto -entry "./cmd/gost" -output-bin output ./your-project
+# If main in cmd/xxxxx/main.go
+./cross-file-obfuscator -auto -entry "./cmd/xxxxx" -output-bin output ./your-project
 
 # If main in cmd/server/main.go
 ./cross-file-obfuscator -auto -entry "./cmd/server" -output-bin output ./your-project
@@ -988,7 +988,6 @@ A: This issue has been fixed! Current version uses **smart region identification
 **Technical Details**:
 - pclntab is a special region in Go binary files that stores function names and line number information
 - We only perform replacement within this region (usually within 10MB after file offset)
-- embed file content is stored in other regions and won't be touched
 
 ## License
 

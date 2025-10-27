@@ -1643,8 +1643,8 @@ func (o *Obfuscator) createDecryptPackage() error {
 		return nil
 	}
 
-	// 设置解密包路径（在项目根目录下）
-	decryptPkgDir := filepath.Join(o.projectRoot, o.decryptPkgName)
+	// 设置解密包路径（在输出目录下，而不是原始项目目录）
+	decryptPkgDir := filepath.Join(o.outputDir, o.decryptPkgName)
 	if err := os.MkdirAll(decryptPkgDir, 0755); err != nil {
 		return fmt.Errorf("创建解密包目录失败: %v", err)
 	}
@@ -1686,7 +1686,7 @@ func %s(s string) string {
 		return fmt.Errorf("写入解密文件失败: %v", err)
 	}
 
-	// 读取go.mod获取模块名
+	// 读取go.mod获取模块名（从原始项目目录读取）
 	goModPath := filepath.Join(o.projectRoot, "go.mod")
 	goModContent, err := ioutil.ReadFile(goModPath)
 	if err != nil {

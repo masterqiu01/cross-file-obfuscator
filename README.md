@@ -155,7 +155,7 @@ go build -o cross-file-obfuscator cmd/obfuscator/main.go
 -output-bin <文件名>         输出二进制文件名（配合 -build-with-linker 或 -auto 使用）
 -entry <包路径>              入口包路径（多入口项目必须指定）
                              - 默认: "." (根目录)
-                             - 示例: "./cmd/server", "./cmd/gost"
+                             - 示例: "./cmd/server", "./cmd/xxxxx"
                              - 用于指定main包位置
 -pkg-replace <映射>          包名替换映射（格式: 'original1=new1,original2=new2'）
 -auto-discover-pkgs          自动发现并替换项目中的所有包名（推荐）
@@ -169,7 +169,7 @@ go build -o cross-file-obfuscator cmd/obfuscator/main.go
 - **常见场景**：
   - `main.go` 在根目录 → 无需指定
   - `cmd/server/main.go` → 需要 `-entry "./cmd/server"`
-  - `cmd/gost/main.go` → 需要 `-entry "./cmd/gost"`
+  - `cmd/xxxxx/main.go` → 需要 `-entry "./cmd/xxxxx"`
 
 ### 使用示例
 
@@ -231,7 +231,6 @@ go build -o cross-file-obfuscator cmd/obfuscator/main.go
 - `myapp` - 混淆后的可执行文件
 
 ---
-
 ### 重要：多入口项目配置
 
 **如何判断是否需要指定 `-entry` 参数？**
@@ -276,12 +275,12 @@ output: current ar archive  # 错误：这是archive，不是可执行文件
 1. 查找main包位置：
 ```bash
 find ./project -name "*.go" -exec grep -l "func main()" {} \;
-# 输出: ./project/cmd/gost/main.go
+# 输出: ./project/cmd/xxxxx/main.go
 ```
 
 2. 添加 `-entry` 参数：
 ```bash
-./cross-file-obfuscator -auto -entry "./cmd/gost" -output-bin output ./project
+./cross-file-obfuscator -auto -entry "./cmd/xxxxx" -output-bin output ./project
 ```
 
 ---
@@ -501,8 +500,8 @@ find ./project -name "*.go" -exec grep -l "func main()" {} \;
 - 映射：所有同名对象使用相同的混淆名
 - 原因：Go 编译器只会编译匹配平台的文件，不会有冲突
 - 示例：
-  - gost/sockopts_linux.go:  func setSocketMark() { ... }
-  - gost/sockopts_other.go:  func setSocketMark() { ... }
+  - xxxxx/sockopts_linux.go:  func setSocketMark() { ... }
+  - xxxxx/sockopts_other.go:  func setSocketMark() { ... }
   - 两者都映射到：fnXXXXXXXXXX
 ```
 
@@ -890,13 +889,13 @@ output: current ar archive  # 错误
 1. **查找main包位置**：
 ```bash
 find ./your-project -name "*.go" -exec grep -l "func main()" {} \;
-# 输出示例: ./your-project/cmd/gost/main.go
+# 输出示例: ./your-project/cmd/xxxxx/main.go
 ```
 
 2. **添加 `-entry` 参数**：
 ```bash
-# 如果main在 cmd/gost/main.go
-./cross-file-obfuscator -auto -entry "./cmd/gost" -output-bin output ./your-project
+# 如果main在 cmd/xxxxx/main.go
+./cross-file-obfuscator -auto -entry "./cmd/xxxxx" -output-bin output ./your-project
 
 # 如果main在 cmd/server/main.go
 ./cross-file-obfuscator -auto -entry "./cmd/server" -output-bin output ./your-project
