@@ -98,7 +98,7 @@
 ### 编译
 
 ```bash
-go build -o cross-file-obfuscator cmd/obfuscator/main.go
+go build -o cross-file-obfuscator cmd/main.go
 ```
 
 #### 注意事项
