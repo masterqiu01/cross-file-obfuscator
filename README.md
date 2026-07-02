@@ -65,6 +65,7 @@ cd ./my_project_obfuscated && go build -trimpath -ldflags="-s -w" -o app.exe
 ```
 
 #### 核心可选项
+- `-project`: 源码根目录路径 (用于在非项目根目录下执行混淆时寻找 go.mod)。
 - `-auto-discover-pkgs`: 自动识别包名 (有 go.mod 时优先解析；无源码时必须配合 `-pkg-filter`)。
 - `-obfuscate-third-party`: 混淆第三方依赖包 (如 `github.com/xxx`)。
 - `-obfuscate-paths`: 混淆二进制中残留的 .go 源文件绝对路径 (默认开启)。
@@ -79,6 +80,7 @@ cd ./my_project_obfuscated && go build -trimpath -ldflags="-s -w" -o app.exe
 | :--- | :--- |
 | `-source` | 启动源码混淆模式 |
 | `-binary` | 启动二进制修改模式 |
+| `-project` | 源码根目录 (用于二进制模式寻找 go.mod) |
 | `-o` | 指定输出目录 (源码模式) |
 | `-encrypt-strings` | 启用字符串 XOR 加密 |
 | `-inject-junk` | 注入随机化的垃圾代码和不透明谓词 |

@@ -68,6 +68,7 @@ func printUsage() {
 	fmt.Println("  -dry-run                    干跑模式：只打印将要混淆的内容，不实际写入任何文件")
 	fmt.Println()
 	fmt.Println("\033[1m■ 二进制修改选项 (配合 -binary):\033[0m")
+	fmt.Println("  -project string             源码根目录路径 (非项目目录执行时，用于定位 go.mod)")
 	fmt.Println("  -auto-discover-pkgs         自动识别项目包名 (有源码时优先扫描源码; 无源码时必须配合 -pkg-filter)")
 	fmt.Println("  -pkg-filter string          包名过滤关键字 (无源码模式下必填, 支持逗号分隔, 如 'pkg1,pkg2')")
 	fmt.Println("  -pkg-replace string         手动指定包名映射 (格式: 'oldpkg=newpkg,lib/math=a/m')")
