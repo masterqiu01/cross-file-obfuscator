@@ -242,6 +242,27 @@ func (lo *LinkerObfuscator) obfuscateFilePaths(data []byte) int {
 		}
 		count++
 	}
+
+	// 额外清理 Go 1.18+ 泛型引入的 go.shape 相关内部字符串
+	shapeRe := regexp.MustCompile(`go\.shape[a-zA-Z0-9_\.\*\[\]\{\}\s\(\)\-/]*`)
+	shapeMatches := shapeRe.FindAllIndex(data, -1)
+	
+	for _, match := range shapeMatches {
+		start := match[0]
+		end := match[1]
+		
+		// 同样使用高位不可见字符，等长替换整个 go.shape 字符串
+		rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(start)))
+		
+		for j := start; j < end; j++ {
+			c := data[j]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+				data[j] = byte(rng.Intn(127) + 128)
+			}
+		}
+		count++
+	}
+
 	return count
 }
 
