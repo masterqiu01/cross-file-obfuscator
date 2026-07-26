@@ -31,6 +31,11 @@ func isStandardLibrary(importPath string) bool {
 		return true
 	}
 
+	// cgo 伪包 "C" 不能被重命名
+	if importPath == "C" {
+		return false
+	}
+
 	// 获取路径的第一个组件（第一个斜杠之前）
 	firstComponent := importPath
 	if idx := strings.Index(importPath, "/"); idx != -1 {

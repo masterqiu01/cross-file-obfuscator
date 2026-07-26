@@ -42,10 +42,10 @@ go build -o cross-file-obfuscator cmd/main.go
 
 #### 场景 2: 二进制全量混淆 (推荐)
 **功能**: 读取 go.mod 自动混淆所有项目包与第三方包，替换文件路径为不可见字符。
-**命令**: (需在包含 go.mod 的目录下执行)
+**命令**: (如果执行目录与源码根目录不同，可通过 -project 手动指定包含 go.mod 的项目路径)
 ```bash
 go build -trimpath -o app.exe
-./cross-file-obfuscator -binary -auto-discover-pkgs -obfuscate-third-party app.exe
+./cross-file-obfuscator -binary -auto-discover-pkgs -obfuscate-third-party -project /path/to/your/project app.exe
 ```
 
 #### 场景 3: 最小化二进制混淆 (适用于 Windows 防误报)
