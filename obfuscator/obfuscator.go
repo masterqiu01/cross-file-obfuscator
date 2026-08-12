@@ -1,10 +1,8 @@
 package obfuscator
 
 import (
-	"crypto/rand"
 	"fmt"
 	"go/token"
-	"math/big"
 )
 
 // New 创建新的混淆器实例
@@ -22,69 +20,68 @@ func New(projectRoot, outputDir string, config *Config) *Obfuscator {
 		}
 	}
 
-	seed, _ := rand.Int(rand.Reader, big.NewInt(999999))
 	encryptionKey := generateRandomString(64)
 	// 生成完全随机的导出函数名（首字母大写）
-	decryptFuncName := fmt.Sprintf("%c%s", 'A'+byte(seed.Int64()%26), generateRandomString(11))
+	decryptFuncName := fmt.Sprintf("%c%s", 'A'+rng.IntN(26), generateRandomString(11))
 	decryptPkgName := fmt.Sprintf("p%s", generateRandomString(8))
 
+	// 为每种字符串解密策略生成独立的随机函数名
+	decryptFuncNames := make([]string, numDecryptStrategies)
+	for i := range decryptFuncNames {
+		decryptFuncNames[i] = fmt.Sprintf("%c%s", 'A'+rng.IntN(26), generateRandomString(11))
+	}
+
 	return &Obfuscator{
-		varMapping:          make(map[string]string),
-		funcMapping:         make(map[string]string),
-		exportedFuncMapping: make(map[string]string),
-		fset:                token.NewFileSet(),
-		randomSeed:          seed,
-		encryptionKey:       encryptionKey,
-		namingCounter:       0,
-		projectRoot:         projectRoot,
-		outputDir:           outputDir,
-		importAliasMapping:  make(map[string]string),
-		importPathToName:    make(map[string]string),
-		fileNameMapping:     make(map[string]string),
-		filePathMapping:     make(map[string]string),
-		protectedNames:      make(map[string]bool),
-		packageNames:        make(map[string]bool),
-		Config:              config,
-		encryptedStrings:    make(map[string]bool),
-		decryptFuncAdded:    make(map[string]bool),
-		decryptFuncName:     decryptFuncName,
-		decryptPkgName:      decryptPkgName,
-		decryptPkgCreated:   false,
-		skippedFiles:        make(map[string]string),
-		reflectionPackages:  make(map[string]bool),
-		fileScopes:          make(map[string]*ScopeAnalyzer),
-		objectMapping:       make(map[*Object]string),
-		mainFiles:           make(map[string]bool),
-		embedFiles:          make(map[string]bool),
+		varMapping:            make(map[string]string),
+		funcMapping:           make(map[string]string),
+		importAliasMapping:    make(map[string]string),
+		fileNameMapping:       make(map[string]string),
+		usedNames:             make(map[string]bool),
+		fset:                  token.NewFileSet(),
+		encryptionKey:         encryptionKey,
+		projectRoot:           projectRoot,
+		outputDir:             outputDir,
+		protectedNames:        make(map[string]bool),
+		packageNames:          make(map[string]bool),
+		Config:                config,
+		decryptFuncName:       decryptFuncName,
+		decryptFuncNames:      decryptFuncNames,
+		decryptPkgName:        decryptPkgName,
+		fileScopes:            make(map[string]*ScopeAnalyzer),
+		objectMapping:         make(map[*Object]string),
+		mainFiles:             make(map[string]bool),
+		embedFiles:            make(map[string]bool),
+		skippedFiles:          make(map[string]string),
+		reflectionTargetTypes: make(map[string]bool),
 	}
 }
 
 // GetStatistics 返回混淆统计信息
 func (o *Obfuscator) GetStatistics() *Statistics {
-	// 统计对象映射中的函数和变量
-	funcCount := len(o.funcMapping)
-	varCount := len(o.varMapping)
-	
-	// 如果使用了作用域分析，从objectMapping统计
+	funcCount, varCount := 0, 0
 	if len(o.objectMapping) > 0 {
-		funcCount = 0
-		varCount = 0
 		for obj, obfName := range o.objectMapping {
 			if obfName != "" {
-				if obj.Kind == ObjFunc {
+				switch obj.Kind {
+				case ObjFunc:
 					funcCount++
-				} else if obj.Kind == ObjVar || obj.Kind == ObjConst {
+				case ObjVar, ObjConst:
 					varCount++
 				}
 			}
 		}
+	} else {
+		funcCount = len(o.funcMapping)
+		varCount = len(o.varMapping)
 	}
-	
+
 	return &Statistics{
-		ProtectedNames: len(o.protectedNames),
-		FunctionsObf:   funcCount,
-		VariablesObf:   varCount,
-		SkippedFiles:   len(o.skippedFiles),
+		TotalFiles:      o.totalGoFiles,
+		ObfuscatedFiles: o.obfuscatedGoFiles,
+		ProtectedNames:  len(o.protectedNames),
+		FunctionsObf:    funcCount,
+		VariablesObf:    varCount,
+		StringsEncrypt:  o.encryptedStringCount,
+		SkippedFiles:    len(o.skippedFiles),
 	}
 }
-

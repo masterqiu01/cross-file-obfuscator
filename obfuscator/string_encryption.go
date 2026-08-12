@@ -1,123 +1,52 @@
 package obfuscator
 
-import (
-	"encoding/base64"
-	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
+import "encoding/base64"
+
+// decryptStrategy 字符串解密策略，每种策略对应生成一个独立的解密函数。
+// 多样化的策略使单次识别无法批量解密全部字符串。
+type decryptStrategy int
+
+const (
+	strategyXOR    decryptStrategy = 0 // 纯 XOR
+	strategyXORAdd decryptStrategy = 1 // XOR + 索引加法
+	strategyXORRot decryptStrategy = 2 // 字节循环移位 + XOR
 )
 
-// encryptString 使用 XOR 加密字符串
-func (o *Obfuscator) encryptString(text string) string {
+// numDecryptStrategies 支持的策略数量
+const numDecryptStrategies = 3
+
+// rotateLeft8 循环左移 8 位字节
+func rotateLeft8(b byte, r uint) byte {
+	r %= 8
+	return (b << r) | (b >> (8 - r))
+}
+
+// rotateRight8 循环右移 8 位字节
+func rotateRight8(b byte, r uint) byte {
+	r %= 8
+	return (b >> r) | (b << (8 - r))
+}
+
+// encryptStringWithStrategy 使用指定策略加密字符串，返回 base64 编码的密文。
+func (o *Obfuscator) encryptStringWithStrategy(text string, strategy decryptStrategy) string {
 	key := o.encryptionKey
 	textBytes := []byte(text)
 	encryptedBytes := make([]byte, len(textBytes))
+	kl := len(key)
 
 	for i, b := range textBytes {
-		keyByte := key[i%len(key)]
-		encryptedBytes[i] = b ^ keyByte
+		k := key[i%kl]
+		switch strategy {
+		case strategyXOR:
+			encryptedBytes[i] = b ^ k
+		case strategyXORAdd:
+			encryptedBytes[i] = (b ^ k) + byte(i&0xff)
+		case strategyXORRot:
+			encryptedBytes[i] = rotateLeft8(b, uint(k)) ^ k
+		default:
+			encryptedBytes[i] = b ^ k
+		}
 	}
 
 	return base64.StdEncoding.EncodeToString(encryptedBytes)
-}
-
-// generateDecryptFunction 生成解密函数源代码
-func (o *Obfuscator) generateDecryptFunction(base64Alias string) string {
-	keyBytes := []byte(o.encryptionKey)
-	keyLiteral := "[]byte{"
-	for i, b := range keyBytes {
-		if i > 0 {
-			keyLiteral += ", "
-		}
-		keyLiteral += fmt.Sprintf("%d", b)
-	}
-	keyLiteral += "}"
-
-	funcBody := fmt.Sprintf("func %s(encrypted string) string {\n", o.decryptFuncName)
-	funcBody += fmt.Sprintf("\tdata, err := %s.StdEncoding.DecodeString(encrypted)\n", base64Alias)
-	funcBody += "\tif err != nil {\n"
-	funcBody += "\t\treturn \"\"\n"
-	funcBody += "\t}\n"
-	funcBody += fmt.Sprintf("\tkey := %s\n", keyLiteral)
-	funcBody += "\tresult := make([]byte, len(data))\n"
-	funcBody += "\tfor i, b := range data {\n"
-	funcBody += "\t\tresult[i] = b ^ key[i%len(key)]\n"
-	funcBody += "\t}\n"
-	funcBody += "\treturn string(result)\n"
-	funcBody += "}\n"
-	return funcBody
-}
-
-// addDecryptFunction 添加解密函数到 AST
-func (o *Obfuscator) addDecryptFunction(node *ast.File) {
-	// 获取 base64 别名
-	base64Alias := "base64"
-	for _, imp := range node.Imports {
-		if imp.Path != nil && imp.Path.Value == `"encoding/base64"` {
-			if imp.Name != nil {
-				base64Alias = imp.Name.Name
-			}
-			break
-		}
-	}
-	
-	// 生成解密函数代码
-	funcCode := o.generateDecryptFunction(base64Alias)
-	
-	// 解析函数代码为 AST
-	fset := token.NewFileSet()
-	funcNode, err := parser.ParseFile(fset, "", "package temp\n"+funcCode, 0)
-	if err != nil {
-		return
-	}
-	
-	// 提取函数声明并添加到文件
-	if len(funcNode.Decls) > 0 {
-		if funcDecl, ok := funcNode.Decls[0].(*ast.FuncDecl); ok {
-			node.Decls = append(node.Decls, funcDecl)
-		}
-	}
-}
-
-// ensureBase64Import 确保 AST 中存在 base64 导入
-func (o *Obfuscator) ensureBase64Import(node *ast.File) {
-	hasBase64 := false
-	for _, imp := range node.Imports {
-		if imp.Path != nil && imp.Path.Value == `"encoding/base64"` {
-			hasBase64 = true
-			break
-		}
-	}
-
-	if hasBase64 {
-		return
-	}
-
-	base64Import := &ast.ImportSpec{
-		Path: &ast.BasicLit{
-			Kind:  token.STRING,
-			Value: `"encoding/base64"`,
-		},
-	}
-
-	var importDecl *ast.GenDecl
-	for _, decl := range node.Decls {
-		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
-			importDecl = genDecl
-			break
-		}
-	}
-
-	if importDecl != nil {
-		importDecl.Specs = append(importDecl.Specs, base64Import)
-	} else {
-		importDecl = &ast.GenDecl{
-			Tok:   token.IMPORT,
-			Specs: []ast.Spec{base64Import},
-		}
-		node.Decls = append([]ast.Decl{importDecl}, node.Decls...)
-	}
-
-	node.Imports = append(node.Imports, base64Import)
 }

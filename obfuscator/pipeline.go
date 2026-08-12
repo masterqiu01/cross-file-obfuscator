@@ -8,38 +8,72 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
-	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"cross-file-obfuscator/internal/logger"
 )
 
 // Run 执行整个混淆流程
 func (o *Obfuscator) Run() error {
 	// 第一步：从 go.mod 读取模块名，用于后续精确判断项目内部包
 	if err := o.readModuleName(); err != nil {
-		log.Printf("警告: 无法读取 go.mod (将使用文件夹名启发式判断): %v", err)
+		logger.Warnf("无法读取 go.mod (将使用文件夹名启发式判断): %v", err)
 	}
 
-	// 如果启用了字符串加密，创建解密包并保护相关名称
+	// 如果启用了字符串加密，创建解密包并保护相关名称（干跑模式下不创建任何文件）
 	if o.Config.EncryptStrings {
 		// 提前保护解密函数名称和包名
 		o.protectedNames[o.decryptFuncName] = true
+		for _, name := range o.decryptFuncNames {
+			o.protectedNames[name] = true
+		}
 		o.packageNames[o.decryptPkgName] = true
 
-		if err := o.createDecryptPackage(); err != nil {
-			return fmt.Errorf("创建解密包失败: %v", err)
+		if !o.Config.DryRun {
+			if err := o.createDecryptPackage(); err != nil {
+				return fmt.Errorf("创建解密包失败: %v", err)
+			}
 		}
 	}
 
-	log.Println("阶段 0/5: 收集导入信息...")
-	if err := o.collectImportInfo(); err != nil {
-		return fmt.Errorf("收集导入信息失败: %v", err)
+	logger.Infof("阶段 1/5: 扫描项目(收集导入/保护名/作用域)...")
+	if err := o.scanProject(); err != nil {
+		return fmt.Errorf("扫描项目失败: %v", err)
 	}
 
-	log.Println("阶段 1/5: 扫描项目并收集保护名称...")
-	err := filepath.Walk(o.projectRoot, func(path string, info os.FileInfo, err error) error {
+	// 反射精确保护收尾：递归展开已命中的反射目标类型（字段指向的命名类型等）
+	o.protectReflectionTypes()
+
+	logger.Infof("阶段 2/5: 构建混淆映射...")
+	o.buildObfuscationMapsWithScope()
+
+	// 干跑模式：只打印会混淆的内容，不实际执行文件操作
+	if o.Config.DryRun {
+		return o.printDryRunReport()
+	}
+
+	logger.Infof("阶段 3/5: 复制项目文件...")
+	// 构建文件名映射（原始路径 -> 混淆后路径）
+	fileMapping := make(map[string]string)
+	if err := o.copyProjectAndBuildMapping(fileMapping); err != nil {
+		return fmt.Errorf("复制项目失败: %v", err)
+	}
+
+	logger.Infof("阶段 4/5: 混淆输出文件...")
+	if err := o.obfuscateOutputFiles(fileMapping); err != nil {
+		return fmt.Errorf("应用混淆失败: %v", err)
+	}
+
+	return nil
+}
+
+// scanProject 单遍扫描项目：合并导入信息收集、保护名称收集、反射保护、
+// 作用域分析、平台特定文件识别，避免同一文件被多次解析。
+func (o *Obfuscator) scanProject() error {
+	return filepath.Walk(o.projectRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -65,122 +99,68 @@ func (o *Obfuscator) Run() error {
 		// 解析文件
 		node, err := parser.ParseFile(o.fset, path, nil, parser.ParseComments)
 		if err != nil {
-			log.Printf("警告: 无法解析文件 %s: %v", path, err)
+			logger.Warnf("无法解析文件 %s: %v", path, err)
 			o.skippedFiles[path] = fmt.Sprintf("Parse error: %v", err)
 			return nil
 		}
 
+		o.totalGoFiles++
+
+		// 收集导入信息（包名、标准库别名）
+		o.collectImportInfoFromFile(node)
+
 		// 收集保护名称
 		o.collectProtectedNames(node, path)
 
-		// 检查反射使用
+		// 构建作用域分析（先于反射精确分析，供标识符类型解析复用）
+		analyzer := NewScopeAnalyzer(o.fset)
+		analyzer.Analyze(node)
+		o.fileScopes[path] = analyzer
+
+		// 反射精确保护：收集被 reflect/JSON 实际引用的类型（garble 式）
 		if o.Config.PreserveReflection {
-			o.protectReflectionTypes(node)
+			o.collectReflectionUsage(node, analyzer)
 		}
 
 		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("扫描项目失败: %v", err)
-	}
+}
 
-	log.Println("阶段 2/5: 构建作用域分析...")
-	if err := o.buildScopeAnalysis(); err != nil {
-		return fmt.Errorf("作用域分析失败: %v", err)
-	}
-
-	log.Println("阶段 3/5: 构建混淆映射...")
-	o.buildObfuscationMapsWithScope()
-
-	log.Println("阶段 4/5: 复制项目文件...")
-	// 构建文件名映射（原始路径 -> 混淆后路径）
-	fileMapping := make(map[string]string)
-
-	// 干跑模式：只打印会混淆的内容，不实际执行文件操作
-	if o.Config.DryRun {
-		return o.printDryRunReport()
-	}
-
-	if err := o.copyProjectAndBuildMapping(fileMapping); err != nil {
-		return fmt.Errorf("复制项目失败: %v", err)
-	}
-
-	log.Println("阶段 5/5: 应用混淆...")
-	// 第一遍：只处理非平台特定的文件（优先添加解密函数）
-	err = filepath.Walk(o.outputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() || !strings.HasSuffix(path, ".go") {
-			return nil
+// collectImportInfoFromFile 收集单个文件的导入信息
+func (o *Obfuscator) collectImportInfoFromFile(node *ast.File) {
+	// 处理所有导入
+	for _, imp := range node.Imports {
+		if imp.Path == nil {
+			continue
 		}
 
-		// 检查是否跳过文件
-		relPath, _ := filepath.Rel(o.outputDir, path)
+		pkgPath := strings.Trim(imp.Path.Value, `"`)
 
-		// 跳过解密包自身
-		if o.Config.EncryptStrings && o.decryptPkgName != "" {
-			if relPath == o.decryptPkgName || strings.HasPrefix(relPath, o.decryptPkgName+string(filepath.Separator)) {
-				return nil
+		// 确定代码中使用的包名
+		var pkgName string
+		if imp.Name != nil {
+			// 跳过空白导入和点导入
+			if imp.Name.Name == "_" || imp.Name.Name == "." {
+				continue
+			}
+			pkgName = imp.Name.Name
+		} else {
+			// 使用基础名称
+			pkgName = filepath.Base(pkgPath)
+		}
+
+		// 标记包名为受保护
+		o.packageNames[pkgName] = true
+
+		// 只为标准库创建别名
+		if isStandardLibrary(pkgPath) {
+			if _, exists := o.importAliasMapping[pkgPath]; !exists {
+				alias := fmt.Sprintf("p%s", generateRandomString(8))
+				o.importAliasMapping[pkgPath] = alias
+				o.usedNames[alias] = true
 			}
 		}
-
-		originalPath := filepath.Join(o.projectRoot, relPath)
-		if _, skipped := o.skippedFiles[originalPath]; skipped {
-			return nil
-		}
-
-		// 只处理非平台特定的文件
-		if !o.isFilePlatformSpecific(path) {
-			if err := o.obfuscateFileWithMapping(path, fileMapping); err != nil {
-				return fmt.Errorf("混淆文件 %s 失败: %v", path, err)
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("应用混淆失败（第一遍）: %v", err)
 	}
-
-	// 第二遍：处理平台特定的文件（如果包还没有解密函数，在第一个遇到的文件中添加）
-	err = filepath.Walk(o.outputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() || !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-
-		// 检查是否跳过文件
-		relPath, _ := filepath.Rel(o.outputDir, path)
-
-		// 跳过解密包自身
-		if o.Config.EncryptStrings && o.decryptPkgName != "" {
-			if relPath == o.decryptPkgName || strings.HasPrefix(relPath, o.decryptPkgName+string(filepath.Separator)) {
-				return nil
-			}
-		}
-
-		originalPath := filepath.Join(o.projectRoot, relPath)
-		if _, skipped := o.skippedFiles[originalPath]; skipped {
-			return nil
-		}
-
-		// 只处理平台特定的文件
-		if o.isFilePlatformSpecific(path) {
-			if err := o.obfuscateFileWithMapping(path, fileMapping); err != nil {
-				return fmt.Errorf("混淆文件 %s 失败: %v", path, err)
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("应用混淆失败（第二遍）: %v", err)
-	}
-
-	return nil
 }
 
 // printDryRunReport 打印干跑报告：展示将要混淆的内容，不实际写入任何文件
@@ -249,72 +229,6 @@ func (o *Obfuscator) printDryRunReport() error {
 	return nil
 }
 
-// collectImportInfo 收集所有文件的导入信息
-func (o *Obfuscator) collectImportInfo() error {
-	return filepath.Walk(o.projectRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
-			return err
-		}
-		if strings.Contains(path, "vendor/") {
-			return nil
-		}
-
-		// 跳过排除的文件
-		if shouldExclude, _ := o.shouldExcludeFile(path); shouldExclude {
-			return nil
-		}
-
-		node, err := parser.ParseFile(o.fset, path, nil, parser.ParseComments)
-		if err != nil {
-			return nil // 跳过无法解析的文件
-		}
-
-		// 处理所有导入
-		for _, imp := range node.Imports {
-			if imp.Path == nil {
-				continue
-			}
-
-			pkgPath := strings.Trim(imp.Path.Value, `"`)
-
-			// 确定代码中使用的包名
-			var pkgName string
-			if imp.Name != nil {
-				// 跳过空白导入和点导入
-				if imp.Name.Name == "_" || imp.Name.Name == "." {
-					continue
-				}
-				pkgName = imp.Name.Name
-			} else {
-				// 使用基础名称
-				pkgName = filepath.Base(pkgPath)
-			}
-
-			// 存储映射
-			if existingName, exists := o.importPathToName[pkgPath]; exists {
-				if existingName != pkgName {
-					log.Printf("警告: 包 %s 的名称不一致: %s vs %s", pkgPath, existingName, pkgName)
-				}
-			} else {
-				o.importPathToName[pkgPath] = pkgName
-			}
-
-			// 标记包名为受保护
-			o.packageNames[pkgName] = true
-
-			// 只为标准库创建别名
-			if isStandardLibrary(pkgPath) {
-				if _, exists := o.importAliasMapping[pkgPath]; !exists {
-					alias := fmt.Sprintf("p%s", generateRandomString(8))
-					o.importAliasMapping[pkgPath] = alias
-				}
-			}
-		}
-
-		return nil
-	})
-}
-
 // collectProtectedNames 收集所有不应被混淆的名称，并记录特殊文件
 func (o *Obfuscator) collectProtectedNames(node *ast.File, filePath string) {
 	isTestFile := strings.HasSuffix(filePath, "_test.go")
@@ -340,7 +254,10 @@ func (o *Obfuscator) collectProtectedNames(node *ast.File, filePath string) {
 				}
 			} else if strings.HasPrefix(text, "//go:linkname ") {
 				parts := strings.Fields(text)
-				if len(parts) >= 2 {
+				// 单参形式（`//go:linkname x`，仅为本地符号挂接 asm/cgo）：加保护，
+				// 避免混淆破坏链接；双参形式（`//go:linkname x [pkg.]y`）不在此保护，
+				// 由 obfuscateFileWithMapping 阶段重写本地名与项目内目标名。
+				if len(parts) == 2 {
 					o.protectedNames[parts[1]] = true
 				}
 			} else if strings.HasPrefix(text, "//go:embed ") {
@@ -477,137 +394,13 @@ func (o *Obfuscator) isProjectImportPath(importPath string) bool {
 
 // readModuleName 从 go.mod 读取模块名并缓存到 o.moduleName
 func (o *Obfuscator) readModuleName() error {
-	goModPath := filepath.Join(o.projectRoot, "go.mod")
-	content, err := ioutil.ReadFile(goModPath)
+	name, err := readModuleNameFromFile(filepath.Join(o.projectRoot, "go.mod"))
 	if err != nil {
 		return err
 	}
-	for _, line := range strings.Split(string(content), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "module ") {
-			o.moduleName = strings.TrimSpace(strings.TrimPrefix(line, "module"))
-			log.Printf("读取模块名成功: %s", o.moduleName)
-			return nil
-		}
-	}
-	return fmt.Errorf("go.mod 中未找到 module 声明")
-}
-
-// isProjectPackage 检查包名是否属于项目内部
-func (o *Obfuscator) isProjectPackage(pkgName string) bool {
-	// 检查是否在项目的包名列表中
-	// 项目内部的包通常不包含点号（如Common, Core等）
-	// 而外部包通常有点号或是标准库名称
-
-	// 如果包名包含点号，很可能是外部包
-	if strings.Contains(pkgName, ".") {
-		return false
-	}
-
-	// 检查是否是标准库包名
-	stdLibPackages := map[string]bool{
-		"fmt": true, "os": true, "io": true, "net": true, "http": true,
-		"time": true, "strings": true, "bytes": true, "bufio": true,
-		"encoding": true, "json": true, "xml": true, "base64": true,
-		"crypto": true, "errors": true, "flag": true, "log": true,
-		"math": true, "rand": true, "reflect": true, "regexp": true,
-		"runtime": true, "sort": true, "strconv": true, "sync": true,
-		"syscall": true, "testing": true, "unicode": true, "unsafe": true,
-		"context": true, "database": true, "sql": true, "path": true,
-		"filepath": true, "template": true, "text": true, "html": true,
-		"url": true, "ioutil": true, "atomic": true, "binary": true,
-	}
-
-	if stdLibPackages[pkgName] {
-		return false
-	}
-
-	// 其他情况认为是项目内部包
-	return true
-}
-
-// buildObfuscationMaps 构建混淆映射（旧版本，保留用于向后兼容）
-func (o *Obfuscator) buildObfuscationMaps() {
-	filepath.Walk(o.projectRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
-			return err
-		}
-		if strings.Contains(path, "vendor/") {
-			return nil
-		}
-
-		// 跳过排除的文件
-		if _, excluded := o.skippedFiles[path]; excluded {
-			return nil
-		}
-
-		node, err := parser.ParseFile(o.fset, path, nil, parser.ParseComments)
-		if err != nil {
-			return nil
-		}
-
-		// 只收集包级别的函数和变量
-		// 不收集局部变量以避免作用域冲突
-		for _, decl := range node.Decls {
-			switch d := decl.(type) {
-			case *ast.FuncDecl:
-				// 收集函数名（跳过方法）
-				if d.Recv == nil && !o.shouldProtect(d.Name.Name) {
-					// 根据配置决定是否混淆导出函数
-					if !isExported(d.Name.Name) || o.Config.ObfuscateExported {
-						o.obfuscateName(d.Name.Name, true)
-					}
-				}
-
-			case *ast.GenDecl:
-				// 只处理包级别的变量和常量声明
-				if d.Tok == token.VAR || d.Tok == token.CONST {
-					for _, spec := range d.Specs {
-						if valueSpec, ok := spec.(*ast.ValueSpec); ok {
-							for _, name := range valueSpec.Names {
-								if !o.shouldProtect(name.Name) {
-									if !isExported(name.Name) || o.Config.ObfuscateExported {
-										o.obfuscateName(name.Name, false)
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		return nil
-	})
-}
-
-// buildScopeAnalysis 为所有文件构建作用域分析
-func (o *Obfuscator) buildScopeAnalysis() error {
-	return filepath.Walk(o.projectRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
-			return err
-		}
-		if strings.Contains(path, "vendor/") {
-			return nil
-		}
-
-		// 跳过排除的文件
-		if _, excluded := o.skippedFiles[path]; excluded {
-			return nil
-		}
-
-		node, err := parser.ParseFile(o.fset, path, nil, parser.ParseComments)
-		if err != nil {
-			return nil
-		}
-
-		// 创建作用域分析器并分析文件
-		analyzer := NewScopeAnalyzer(o.fset)
-		analyzer.Analyze(node)
-		o.fileScopes[path] = analyzer
-
-		return nil
-	})
+	o.moduleName = name
+	logger.Infof("读取模块名成功: %s", o.moduleName)
+	return nil
 }
 
 // buildObfuscationMapsWithScope 使用作用域分析构建混淆映射
@@ -619,7 +412,7 @@ func (o *Obfuscator) buildObfuscationMapsWithScope() {
 	for filePath, analyzer := range o.fileScopes {
 		fileScope := analyzer.GetFileScope()
 		if fileScope == nil {
-			log.Printf("警告: 文件 %s 没有文件作用域", filePath)
+			logger.Warnf("文件 %s 没有文件作用域", filePath)
 			continue
 		}
 
@@ -634,9 +427,6 @@ func (o *Obfuscator) buildObfuscationMapsWithScope() {
 			}
 			// 跳过类型定义 (ObjType)
 		}
-
-		// 收集局部作用域的对象
-		o.collectObjectsForObfuscation(fileScope)
 	}
 
 	// 第二步：按名称分组对象（方案1 + build-tag支持）
@@ -667,8 +457,7 @@ func (o *Obfuscator) buildObfuscationMapsWithScope() {
 			continue
 		}
 
-		// [V] 方案1：为所有同名对象生成相同的混淆名
-		// 这样可以支持build-tag场景（不同文件的同名函数）
+		// 方案1：为所有同名对象生成相同的混淆名（支持build-tag场景）
 		obfName := o.generateUniqueObfuscatedNameForObject(firstObj)
 
 		// 将相同的混淆名应用到所有同名对象
@@ -688,31 +477,11 @@ func (o *Obfuscator) buildObfuscationMapsWithScope() {
 
 		// 如果有多个同名对象，打印日志
 		if len(objects) > 1 {
-			log.Printf("同名对象使用相同混淆名: %s → %s (在 %d 个文件中定义)", name, obfName, len(objects))
+			logger.Debugf("同名对象使用相同混淆名: %s → %s (在 %d 个文件中定义)", name, obfName, len(objects))
 		}
 	}
 
-	// 第三步：为局部变量生成混淆名称（每个对象独立生成）
-	localVarCount := 0
-	for obj, obfName := range o.objectMapping {
-		// 如果已经有混淆名称，跳过
-		if obfName != "" {
-			continue
-		}
-
-		// 检查是否应该保护
-		if o.shouldProtectObject(obj) {
-			delete(o.objectMapping, obj)
-			continue
-		}
-
-		// 为局部变量生成唯一的混淆名称
-		obfuscatedName := o.generateUniqueObfuscatedNameForObject(obj)
-		o.objectMapping[obj] = obfuscatedName
-		localVarCount++
-	}
-
-	// 同步到funcMapping和varMapping（方案1版本）：
+	// 同步到funcMapping和varMapping：
 	// 所有包级别的名称都同步（包括同名的，因为它们现在使用相同的混淆名）
 	syncCount := 0
 	for name, objects := range nameToObjects {
@@ -735,173 +504,9 @@ func (o *Obfuscator) buildObfuscationMapsWithScope() {
 		}
 	}
 
-	log.Printf("收集到 %d 个包级别名称（函数: %d, 变量: %d），%d 个局部变量",
-		len(nameToObjects), funcCount, varCount, localVarCount)
-	log.Printf("同步了 %d 个名称到名称映射（用于跨文件引用）", syncCount)
-}
-
-// collectObjectsForObfuscation 递归收集作用域中需要混淆的对象
-func (o *Obfuscator) collectObjectsForObfuscation(scope *Scope) {
-	// 收集当前作用域的对象
-	for _, obj := range scope.Objects {
-		// 跳过类型定义，因为类型名可能在多个地方被引用
-		if obj.Kind == ObjType {
-			continue
-		}
-
-		// 判断是否为文件级别：检查是否为文件作用域（通过检查节点类型）
-		isFileLevel := false
-		if scope.Node != nil {
-			_, isFileLevel = scope.Node.(*ast.File)
-		}
-
-		if isFileLevel {
-			// 文件级别的声明（包级别）
-			if obj.Kind == ObjFunc || obj.Kind == ObjVar || obj.Kind == ObjConst {
-				o.objectMapping[obj] = "" // 先标记，稍后生成名称
-			}
-		} else {
-			// 局部作用域的变量（函数内部、块内部等）
-			// 也收集局部变量进行混淆
-			if obj.Kind == ObjVar || obj.Kind == ObjConst {
-				o.objectMapping[obj] = "" // 先标记，稍后生成名称
-			}
-		}
-	}
-
-	// 递归处理子作用域
-	for _, child := range scope.Children {
-		o.collectObjectsForObfuscation(child)
-	}
-}
-
-// shouldProtectObject 检查对象是否应该被保护
-func (o *Obfuscator) shouldProtectObject(obj *Object) bool {
-	return o.shouldProtect(obj.Name)
-}
-
-// generateObfuscatedNameForObject 为对象生成混淆名称
-func (o *Obfuscator) generateObfuscatedNameForObject(obj *Object) string {
-	// 检查是否为导出名称（首字母大写）
-	isExported := obj.IsExported
-
-	// 根据对象类型和是否导出选择前缀
-	var prefix string
-	if isExported {
-		// 导出名称：使用大写前缀
-		if obj.Kind == ObjFunc {
-			prefix = "Fn" // 导出函数
-		} else if obj.Kind == ObjConst {
-			prefix = "C" // 导出常量
-		} else if obj.Kind == ObjVar {
-			prefix = "V" // 导出变量
-		} else {
-			prefix = "X" // 其他导出对象
-		}
-	} else {
-		// 私有名称：使用小写前缀
-		if obj.Kind == ObjFunc {
-			prefix = "fn" // 私有函数
-		} else if obj.Kind == ObjConst {
-			prefix = "c" // 私有常量
-		} else if obj.Kind == ObjVar {
-			prefix = "v" // 私有变量
-		} else {
-			prefix = "l" // 其他私有对象
-		}
-	}
-
-	// 生成唯一的混淆名称
-	maxAttempts := 100
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		obf := fmt.Sprintf("%s%s", prefix, generateRandomString(12))
-
-		// 检查此名称是否已被使用
-		if !o.isObfuscatedNameUsed(obf) {
-			return obf
-		}
-	}
-
-	// 回退：使用基于计数器的方法
-	o.namingCounter++
-	return fmt.Sprintf("%s%d_%s", prefix, o.namingCounter, generateRandomString(8))
-}
-
-// isObfuscatedNameUsed 检查混淆名称是否已被使用
-func (o *Obfuscator) isObfuscatedNameUsed(name string) bool {
-	// 检查对象映射
-	for _, obfName := range o.objectMapping {
-		if obfName == name {
-			return true
-		}
-	}
-
-	// 检查旧的映射（向后兼容）
-	for _, obfName := range o.varMapping {
-		if obfName == name {
-			return true
-		}
-	}
-	for _, obfName := range o.funcMapping {
-		if obfName == name {
-			return true
-		}
-	}
-	for _, obfName := range o.importAliasMapping {
-		if obfName == name {
-			return true
-		}
-	}
-
-	return false
-}
-
-// copyProject 复制项目到输出目录
-func (o *Obfuscator) copyProject() error {
-	return filepath.Walk(o.projectRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		relPath, err := filepath.Rel(o.projectRoot, path)
-		if err != nil {
-			return err
-		}
-
-		// 处理文件名混淆（只对未被排除的 Go 文件）
-		outputPath := filepath.Join(o.outputDir, relPath)
-		if o.Config.ObfuscateFileNames && strings.HasSuffix(path, ".go") {
-			// 检查文件是否被排除
-			_, isSkipped := o.skippedFiles[path]
-
-			// 检查是否受保护的文件 (main 或被 embed 引用)
-			isProtectedFile := o.mainFiles[path] || o.embedFiles[path]
-			if !isProtectedFile {
-				// 检查通配符 embed
-				dirPath := filepath.Dir(path)
-				if o.embedFiles[filepath.Join(dirPath, "*.go")] {
-					isProtectedFile = true
-				}
-			}
-
-			if !isSkipped && !isProtectedFile {
-				dir := filepath.Dir(outputPath)
-				base := filepath.Base(outputPath)
-				// 使用 obfuscateFileName 函数，它会保护 main.go 等特殊文件
-				obfuscatedName := o.obfuscateFileName(base)
-				if obfuscatedName != base {
-					outputPath = filepath.Join(dir, obfuscatedName)
-				}
-			}
-		}
-
-		if info.IsDir() {
-			return os.MkdirAll(outputPath, info.Mode())
-		}
-
-		// 复制文件（包括被排除的文件）
-		return o.copyFile(path, outputPath)
-	})
+	logger.Infof("收集到 %d 个包级别名称（函数: %d, 变量: %d）",
+		len(nameToObjects), funcCount, varCount)
+	logger.Debugf("同步了 %d 个名称到名称映射（用于跨文件引用）", syncCount)
 }
 
 // copyProjectAndBuildMapping 复制项目到输出目录并构建文件映射
@@ -957,8 +562,13 @@ func (o *Obfuscator) copyProjectAndBuildMapping(fileMapping map[string]string) e
 	})
 }
 
-// copyFile 复制单个文件
+// copyFile 复制单个文件（保留源文件的权限位）
 func (o *Obfuscator) copyFile(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -969,7 +579,7 @@ func (o *Obfuscator) copyFile(src, dst string) error {
 		return err
 	}
 
-	dstFile, err := os.Create(dst)
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
 	if err != nil {
 		return err
 	}
@@ -979,117 +589,46 @@ func (o *Obfuscator) copyFile(src, dst string) error {
 	return err
 }
 
-// obfuscateFile 混淆单个文件
-func (o *Obfuscator) obfuscateFile(filePath string) error {
-	// 解析文件
-	node, err := parser.ParseFile(o.fset, filePath, nil, parser.ParseComments)
-	if err != nil {
-		return fmt.Errorf("解析文件失败: %v", err)
-	}
+// obfuscateOutputFiles 单遍遍历输出目录并应用混淆（不区分平台特定文件）
+func (o *Obfuscator) obfuscateOutputFiles(fileMapping map[string]string) error {
+	return filepath.Walk(o.outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
 
-	// 移除注释（保留构建标签和编译指令）
-	if o.Config.RemoveComments {
-		var filteredComments []*ast.CommentGroup
-		for _, cg := range node.Comments {
-			var keepComments []*ast.Comment
-			for _, c := range cg.List {
-				if o.shouldKeepComment(c.Text) {
-					keepComments = append(keepComments, c)
-				}
-			}
-			if len(keepComments) > 0 {
-				cg.List = keepComments
-				filteredComments = append(filteredComments, cg)
+		// 跳过解密包自身
+		if o.Config.EncryptStrings && o.decryptPkgName != "" {
+			relPath, _ := filepath.Rel(o.outputDir, path)
+			if relPath == o.decryptPkgName || strings.HasPrefix(relPath, o.decryptPkgName+string(filepath.Separator)) {
+				return nil
 			}
 		}
-		node.Comments = filteredComments
 
-		// 清除已空的文档注释
-		for _, decl := range node.Decls {
-			if genDecl, ok := decl.(*ast.GenDecl); ok {
-				if genDecl.Doc != nil && len(genDecl.Doc.List) == 0 {
-					genDecl.Doc = nil
-				}
-				for _, spec := range genDecl.Specs {
-					if typeSpec, ok := spec.(*ast.TypeSpec); ok {
-						if typeSpec.Doc != nil && len(typeSpec.Doc.List) == 0 {
-							typeSpec.Doc = nil
-						}
-						if typeSpec.Comment != nil && len(typeSpec.Comment.List) == 0 {
-							typeSpec.Comment = nil
-						}
-					}
-					if valueSpec, ok := spec.(*ast.ValueSpec); ok {
-						if valueSpec.Doc != nil && len(valueSpec.Doc.List) == 0 {
-							valueSpec.Doc = nil
-						}
-						if valueSpec.Comment != nil && len(valueSpec.Comment.List) == 0 {
-							valueSpec.Comment = nil
-						}
-					}
-					if importSpec, ok := spec.(*ast.ImportSpec); ok {
-						if importSpec.Doc != nil && len(importSpec.Doc.List) == 0 {
-							importSpec.Doc = nil
-						}
-						if importSpec.Comment != nil && len(importSpec.Comment.List) == 0 {
-							importSpec.Comment = nil
-						}
-					}
-				}
-			}
-			if funcDecl, ok := decl.(*ast.FuncDecl); ok {
-				if funcDecl.Doc != nil && len(funcDecl.Doc.List) == 0 {
-					funcDecl.Doc = nil
-				}
-			}
+		// 通过映射获取原始路径
+		originalPath := fileMapping[path]
+		if originalPath == "" {
+			relPath, _ := filepath.Rel(o.outputDir, path)
+			originalPath = filepath.Join(o.projectRoot, relPath)
 		}
-	}
 
-	// 获取原始文件路径（从输出目录映射回项目根目录）
-	relPath, _ := filepath.Rel(o.outputDir, filePath)
-	originalPath := filepath.Join(o.projectRoot, relPath)
-
-	// 应用转换（使用作用域信息）
-	o.applyTransformationsWithScope(node, originalPath)
-
-	// 格式化并写入
-	var buf bytes.Buffer
-	if err := format.Node(&buf, o.fset, node); err != nil {
-		return fmt.Errorf("格式化失败: %v", err)
-	}
-
-	source := buf.String()
-
-	// 字符串加密
-	if o.Config.EncryptStrings {
-		hadEncryption := o.encryptStringsInAST(node)
-
-		if hadEncryption {
-			// 先加密字符串字面量（使用解密包的函数）
-			var actuallyEncrypted bool
-			source, actuallyEncrypted = o.encryptStringsInSourceWithPackage(source)
-
-			// 只有在真正加密了字符串时才添加解密包导入
-			if actuallyEncrypted {
-				source = o.ensureDecryptPackageImport(source)
-			}
+		if _, skipped := o.skippedFiles[originalPath]; skipped {
+			return nil
 		}
-	}
 
-	// 写回文件
-	return ioutil.WriteFile(filePath, []byte(source), 0644)
+		if err := o.obfuscateFileWithMapping(path, fileMapping); err != nil {
+			return fmt.Errorf("混淆文件 %s 失败: %v", path, err)
+		}
+		o.obfuscatedGoFiles++
+
+		return nil
+	})
 }
 
 // obfuscateFileWithMapping 使用文件映射混淆单个文件
 func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[string]string) error {
-	// 兜底跳过解密包自身
-	if o.Config.EncryptStrings && o.decryptPkgName != "" {
-		decryptPkgDir := filepath.Join(o.outputDir, o.decryptPkgName) + string(filepath.Separator)
-		if strings.HasPrefix(filePath, decryptPkgDir) {
-			return nil
-		}
-	}
-
 	// 解析文件
 	node, err := parser.ParseFile(o.fset, filePath, nil, parser.ParseComments)
 	if err != nil {
@@ -1098,60 +637,7 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 
 	// 移除注释（保留构建标签和编译指令）
 	if o.Config.RemoveComments {
-		var filteredComments []*ast.CommentGroup
-		for _, cg := range node.Comments {
-			var keepComments []*ast.Comment
-			for _, c := range cg.List {
-				if o.shouldKeepComment(c.Text) {
-					keepComments = append(keepComments, c)
-				}
-			}
-			if len(keepComments) > 0 {
-				cg.List = keepComments
-				filteredComments = append(filteredComments, cg)
-			}
-		}
-		node.Comments = filteredComments
-
-		// 清除已空的文档注释
-		for _, decl := range node.Decls {
-			if genDecl, ok := decl.(*ast.GenDecl); ok {
-				if genDecl.Doc != nil && len(genDecl.Doc.List) == 0 {
-					genDecl.Doc = nil
-				}
-				for _, spec := range genDecl.Specs {
-					if typeSpec, ok := spec.(*ast.TypeSpec); ok {
-						if typeSpec.Doc != nil && len(typeSpec.Doc.List) == 0 {
-							typeSpec.Doc = nil
-						}
-						if typeSpec.Comment != nil && len(typeSpec.Comment.List) == 0 {
-							typeSpec.Comment = nil
-						}
-					}
-					if valueSpec, ok := spec.(*ast.ValueSpec); ok {
-						if valueSpec.Doc != nil && len(valueSpec.Doc.List) == 0 {
-							valueSpec.Doc = nil
-						}
-						if valueSpec.Comment != nil && len(valueSpec.Comment.List) == 0 {
-							valueSpec.Comment = nil
-						}
-					}
-					if importSpec, ok := spec.(*ast.ImportSpec); ok {
-						if importSpec.Doc != nil && len(importSpec.Doc.List) == 0 {
-							importSpec.Doc = nil
-						}
-						if importSpec.Comment != nil && len(importSpec.Comment.List) == 0 {
-							importSpec.Comment = nil
-						}
-					}
-				}
-			}
-			if funcDecl, ok := decl.(*ast.FuncDecl); ok {
-				if funcDecl.Doc != nil && len(funcDecl.Doc.List) == 0 {
-					funcDecl.Doc = nil
-				}
-			}
-		}
+		o.removeCommentsFromAST(node)
 	}
 
 	// 从文件映射获取原始文件路径
@@ -1163,7 +649,10 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 	}
 
 	// 应用转换（使用作用域信息）
-	o.applyTransformationsWithScope(node, originalPath)
+	o.applyTransformationsWithScope(node)
+
+	// 重写 //go:linkname 指令：本地名跟随混淆映射，项目内目标名同步重写
+	o.rewriteLinknameDirectivesInFile(node)
 
 	// 格式化并写入
 	var buf bytes.Buffer
@@ -1173,32 +662,31 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 
 	source := buf.String()
 
-	// 字符串加密
+	// 字符串加密：按 AST 精确位置加密字符串字面量，有加密时才注入解密包导入
+	// （连续等号对齐不受影响；注释、导入路径、结构体标签、const 值不会被触碰）
 	if o.Config.EncryptStrings {
-		hadEncryption := o.encryptStringsInAST(node)
-
-		if hadEncryption {
-			// 先加密字符串字面量（使用解密包的函数）
-			var actuallyEncrypted bool
-			source, actuallyEncrypted = o.encryptStringsInSourceWithPackage(source)
-
-			// 只有在真正加密了字符串时才添加解密包导入
-			if actuallyEncrypted {
-				source = o.ensureDecryptPackageImport(source)
-			}
-		}
+		var encryptedCount int
+		source, encryptedCount = o.encryptStringsInSource(source)
+		o.encryptedStringCount += encryptedCount
 	}
 
-	// 写回文件
-	return ioutil.WriteFile(filePath, []byte(source), 0644)
+	// 位置信息混淆：为函数调用点插入 //line 伪文件名，隐藏真实源码位置
+	source = o.obfuscatePositions(source)
+
+	// 写回文件（保留原始权限位）
+	mode := os.FileMode(0644)
+	if originalPath != "" {
+		if st, err := os.Stat(originalPath); err == nil {
+			mode = st.Mode().Perm()
+		}
+	}
+	return os.WriteFile(filePath, []byte(source), mode)
 }
 
-// applyTransformations 应用 AST 转换
-func (o *Obfuscator) applyTransformations(node *ast.File) {
-	// 步骤 1: 构建此文件中的包映射
+// applyImportAliases 更新导入语句为标准库别名，返回文件中包名 -> 混淆别名的映射
+func (o *Obfuscator) applyImportAliases(node *ast.File) map[string]string {
 	filePackages := make(map[string]string) // 代码中的包名 -> 混淆别名
 
-	// 更新导入语句并记录包
 	for _, decl := range node.Decls {
 		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
 			for _, spec := range genDecl.Specs {
@@ -1235,127 +723,13 @@ func (o *Obfuscator) applyTransformations(node *ast.File) {
 			}
 		}
 	}
-
-	// 步骤 2: 替换包引用（仅限此文件中导入的包）
-	ast.Inspect(node, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			if ident, ok := sel.X.(*ast.Ident); ok {
-				// 只有当满足以下条件时才替换：
-				// 1. 此包名在此文件中被导入
-				// 2. 标识符没有 Object（包标识符没有设置 Obj）
-				//    如果 Obj 不为 nil，说明它是局部声明的变量/参数
-				if alias, exists := filePackages[ident.Name]; exists {
-					if ident.Obj == nil {
-						ident.Name = alias
-					}
-				}
-			}
-		}
-		return true
-	})
-
-	// 步骤 3: 混淆函数声明
-	ast.Inspect(node, func(n ast.Node) bool {
-		if fn, ok := n.(*ast.FuncDecl); ok {
-			if fn.Recv == nil && !o.shouldProtect(fn.Name.Name) {
-				if obf, exists := o.funcMapping[fn.Name.Name]; exists {
-					fn.Name.Name = obf
-				}
-			}
-		}
-		return true
-	})
-
-	// 步骤 4: 混淆变量声明和赋值
-	ast.Inspect(node, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.ValueSpec:
-			for _, name := range x.Names {
-				if !o.shouldProtect(name.Name) {
-					if obf, exists := o.varMapping[name.Name]; exists {
-						name.Name = obf
-					}
-				}
-			}
-		case *ast.AssignStmt:
-			for _, lhs := range x.Lhs {
-				if ident, ok := lhs.(*ast.Ident); ok {
-					if !o.shouldProtect(ident.Name) {
-						if obf, exists := o.varMapping[ident.Name]; exists {
-							ident.Name = obf
-						}
-					}
-				}
-			}
-		case *ast.Ident:
-			// 混淆标识符引用
-			if !o.shouldProtect(x.Name) {
-				if obf, exists := o.varMapping[x.Name]; exists {
-					x.Name = obf
-				}
-				if obf, exists := o.funcMapping[x.Name]; exists {
-					x.Name = obf
-				}
-			}
-		}
-		return true
-	})
-
-	// 步骤 5: 注入垃圾代码
-	if o.Config.InjectJunkCode {
-		for _, decl := range node.Decls {
-			if fn, ok := decl.(*ast.FuncDecl); ok {
-				if fn.Body != nil && len(fn.Body.List) > 0 && !o.shouldSkipJunkCodeInjection(fn) {
-					junkStmts := o.generateJunkStatements()
-					fn.Body.List = append(junkStmts, fn.Body.List...)
-				}
-			}
-		}
-	}
+	return filePackages
 }
 
 // applyTransformationsWithScope 使用作用域信息应用 AST 转换
-func (o *Obfuscator) applyTransformationsWithScope(node *ast.File, originalFilePath string) {
-	// 步骤 1: 构建此文件中的包映射
-	filePackages := make(map[string]string) // 代码中的包名 -> 混淆别名
-
-	// 更新导入语句并记录包
-	for _, decl := range node.Decls {
-		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
-			for _, spec := range genDecl.Specs {
-				if importSpec, ok := spec.(*ast.ImportSpec); ok {
-					if importSpec.Path != nil {
-						// 跳过空白导入和点导入
-						if importSpec.Name != nil && (importSpec.Name.Name == "_" || importSpec.Name.Name == ".") {
-							continue
-						}
-
-						pkgPath := strings.Trim(importSpec.Path.Value, `"`)
-
-						// 确定代码中使用的包名
-						var pkgNameInCode string
-						if importSpec.Name != nil {
-							pkgNameInCode = importSpec.Name.Name
-						} else {
-							pkgNameInCode = filepath.Base(pkgPath)
-						}
-
-						// 只为标准库应用别名
-						if alias, exists := o.importAliasMapping[pkgPath]; exists {
-							// 更新导入语句
-							if importSpec.Name != nil {
-								importSpec.Name.Name = alias
-							} else {
-								importSpec.Name = &ast.Ident{Name: alias}
-							}
-							// 记录此包供后续使用
-							filePackages[pkgNameInCode] = alias
-						}
-					}
-				}
-			}
-		}
-	}
+func (o *Obfuscator) applyTransformationsWithScope(node *ast.File) {
+	// 步骤 1: 更新导入语句为标准库别名
+	filePackages := o.applyImportAliases(node)
 
 	// 步骤 2: 替换包引用（仅限此文件中导入的包）
 	ast.Inspect(node, func(n ast.Node) bool {
@@ -1375,75 +749,56 @@ func (o *Obfuscator) applyTransformationsWithScope(node *ast.File, originalFileP
 		return true
 	})
 
-	// 获取此文件的作用域分析器
-	analyzer, hasScope := o.fileScopes[originalFilePath]
+	// 步骤 3: 重新做当前文件的作用域分析（obfuscateOutputFiles 解析的是输出目录的副本，
+	// token.Pos 与 scanProject 阶段的源文件不一致，必须基于当前 node 重建作用域，
+	// 才能按位置正确解析标识符所属作用域并处理遮蔽）。
+	analyzer := NewScopeAnalyzer(o.fset)
+	analyzer.Analyze(node)
+	o.obfuscateIdentifiersWithScope(node, analyzer)
 
-	if hasScope {
-		// 步骤 3: 使用作用域信息混淆标识符
-		o.obfuscateIdentifiersWithScope(node, analyzer)
-	} else {
-		// 回退到旧的混淆方法（如果没有作用域信息）
-		log.Printf("警告: 文件 %s 没有作用域信息，使用旧的混淆方法", originalFilePath)
-
-		// 步骤 3: 混淆函数声明
-		ast.Inspect(node, func(n ast.Node) bool {
-			if fn, ok := n.(*ast.FuncDecl); ok {
-				if fn.Recv == nil && !o.shouldProtect(fn.Name.Name) {
-					if obf, exists := o.funcMapping[fn.Name.Name]; exists {
-						fn.Name.Name = obf
-					}
-				}
-			}
-			return true
-		})
-
-		// 步骤 4: 混淆变量声明和赋值
-		ast.Inspect(node, func(n ast.Node) bool {
-			switch x := n.(type) {
-			case *ast.ValueSpec:
-				for _, name := range x.Names {
-					if !o.shouldProtect(name.Name) {
-						if obf, exists := o.varMapping[name.Name]; exists {
-							name.Name = obf
-						}
-					}
-				}
-			case *ast.AssignStmt:
-				for _, lhs := range x.Lhs {
-					if ident, ok := lhs.(*ast.Ident); ok {
-						if !o.shouldProtect(ident.Name) {
-							if obf, exists := o.varMapping[ident.Name]; exists {
-								ident.Name = obf
-							}
-						}
-					}
-				}
-			case *ast.Ident:
-				// 混淆标识符引用
-				if !o.shouldProtect(x.Name) {
-					if obf, exists := o.varMapping[x.Name]; exists {
-						x.Name = obf
-					}
-					if obf, exists := o.funcMapping[x.Name]; exists {
-						x.Name = obf
-					}
-				}
-			}
-			return true
-		})
-	}
-
-	// 步骤 5: 注入垃圾代码
+	// 步骤 4: 注入垃圾代码（收集全文件已用标识符，保证注入名不冲突）
 	if o.Config.InjectJunkCode {
+		used := collectUsedNames(node)
 		for _, decl := range node.Decls {
 			if fn, ok := decl.(*ast.FuncDecl); ok {
 				if fn.Body != nil && len(fn.Body.List) > 0 && !o.shouldSkipJunkCodeInjection(fn) {
-					junkStmts := o.generateJunkStatements()
+					anchors := collectJunkAnchors(fn)
+					// 50% 概率在函数体内部再插入一段垃圾（增加多样性）。
+					// 必须在前置前进行，保证每个垃圾块内部的 goto/label 保持相邻；
+					// 若函数体本身含 goto/标签，跳过中插避免破坏原有控制流。
+					if !bodyHasGoto(fn.Body) && len(fn.Body.List) >= 3 && MascotRandInt(2) == 0 {
+						pos := 1 + MascotRandInt(2)
+						mid := o.generateJunkStatementsWithAnchors(used, anchors)
+						prefix := append([]ast.Stmt(nil), fn.Body.List[:pos]...)
+						rest := append([]ast.Stmt(nil), fn.Body.List[pos:]...)
+						fn.Body.List = append(prefix, append(mid, rest...)...)
+					}
+
+					junkStmts := o.generateJunkStatementsWithAnchors(used, anchors)
 					fn.Body.List = append(junkStmts, fn.Body.List...)
 				}
 			}
 		}
 	}
+}
+
+// bodyHasGoto 判断函数体是否包含 goto 语句或标签（避免插入垃圾破坏既有控制流）
+func bodyHasGoto(body *ast.BlockStmt) bool {
+	has := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.BranchStmt:
+			if x.Tok == token.GOTO {
+				has = true
+				return false
+			}
+		case *ast.LabeledStmt:
+			has = true
+			return false
+		}
+		return true
+	})
+	return has
 }
 
 // obfuscateIdentifiersWithScope 使用作用域信息混淆标识符
@@ -1467,19 +822,21 @@ func (o *Obfuscator) obfuscateIdentifiersWithScope(node *ast.File, analyzer *Sco
 			if x.Type != nil {
 				o.markTypeIdents(x.Type, typeRefs)
 			}
-		case *ast.CallExpr:
-			// 类型转换：只有当Fun是类型标识符时才标记
-			// 例如：int(x), MyType(x)
-			// 但不包括函数调用：myFunc(x)
-			// 简单启发式：如果Fun是Ident且首字母小写，可能是内置类型转换
-			// 更准确的方法需要类型信息，这里我们跳过CallExpr的处理
-			// 因为大部分CallExpr是函数调用，不是类型转换
-			_ = x // 跳过
+		case *ast.CompositeLit:
+			// 复合字面量：T{...} 中的 T 是类型引用（可能与局部变量同名，如 `x := x{}`）
+			if x.Type != nil {
+				o.markTypeIdents(x.Type, typeRefs)
+			}
 		}
 		return true
 	})
 
 	// 第二遍：替换标识符
+	// 辨析：混淆阶段的 ResolveIdent 使用的是输出副本上重建的作用域分析器，
+	// 其对象指针与 scanProject 阶段预构建的 objectMapping 不同，因此这里：
+	//   - 包级对象（analysis-time 找到且属于 fileScope）按名字走 funcMapping/varMapping；
+	//   - 局部对象惰性生成混淆名并缓存在 localNames（同文件一致、正确处理遮蔽）。
+	localNames := make(map[*Object]string)
 	ast.Inspect(node, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.Ident:
@@ -1493,38 +850,38 @@ func (o *Obfuscator) obfuscateIdentifiersWithScope(node *ast.File, analyzer *Sco
 				return true
 			}
 
-			// [V] 改进的替换策略（方案2 + 精确的作用域处理）：
-			//
-			// 问题：简单的作用域查找无法区分"当前位置的作用域"和"文件级作用域"
-			// 例如：局部变量 transport 和 包级函数 transport 同名
-			//
-			// 解决方案：
-			// 1. 先尝试在文件级作用域查找（只查找包级对象，不查找子作用域）
-			// 2. 如果找到且在objectMapping中，使用它
-			// 3. 否则，使用funcMapping/varMapping（跨文件引用）
-			//
-			// 这样可以避免错误地匹配局部变量
-
-			// 只在文件级作用域查找（不递归到子作用域）
-			fileScope := analyzer.GetFileScope()
-			var obj *Object
-			if fileScope != nil {
-				obj = fileScope.Objects[x.Name] // 直接查找，不递归
-			}
-
+			obj := analyzer.ResolveIdent(x.Pos(), x.Name)
 			if obj != nil {
 				// 跳过类型对象
 				if obj.Kind == ObjType {
 					return true
 				}
-				if obfName, hasObf := o.objectMapping[obj]; hasObf && obfName != "" {
+
+				// 包级对象：按名字映射（跨文件一致，支持 build-tag 同名场景）
+				if obj.Scope == analyzer.GetFileScope() {
+					if obfName, exists := o.funcMapping[x.Name]; exists {
+						x.Name = obfName
+						return true
+					}
+					if obfName, exists := o.varMapping[x.Name]; exists {
+						x.Name = obfName
+						return true
+					}
+					return true
+				}
+
+				// 局部对象：同一对象缓存同一个混淆名（同一文件内引用一致）
+				if obfName, hasObf := localNames[obj]; hasObf {
 					x.Name = obfName
 					return true
 				}
+				obfName := o.generateUniqueObfuscatedNameForObject(obj)
+				localNames[obj] = obfName
+				x.Name = obfName
+				return true
 			}
 
-			// 跨文件引用或找不到对象：使用名称映射
-			// funcMapping/varMapping 包含所有唯一名称（不包括同名的私有对象）
+			// 找不到对象（如跨文件引用的包级函数）：使用名称映射兜底
 			if obfName, exists := o.funcMapping[x.Name]; exists {
 				x.Name = obfName
 				return true
@@ -1574,27 +931,6 @@ func (o *Obfuscator) markTypeIdents(expr ast.Expr, typeRefs map[*ast.Ident]bool)
 	}
 }
 
-// findObjectInScopeRecursive 递归查找对象
-func (o *Obfuscator) findObjectInScopeRecursive(name string, scope *Scope) *Object {
-	if scope == nil {
-		return nil
-	}
-
-	// 在当前作用域查找
-	if obj, exists := scope.Objects[name]; exists {
-		return obj
-	}
-
-	// 在子作用域中查找
-	for _, child := range scope.Children {
-		if obj := o.findObjectInScopeRecursive(name, child); obj != nil {
-			return obj
-		}
-	}
-
-	return nil
-}
-
 // shouldKeepComment 判断是否应保留注释
 func (o *Obfuscator) shouldKeepComment(text string) bool {
 	// 保留构建标签和编译指令，以及 CGO 和导出等重要标记
@@ -1612,81 +948,16 @@ func (o *Obfuscator) shouldKeepComment(text string) bool {
 		return true
 	}
 
-	// 判断是否可能是多行纯 C 代码块 (包含常见的 C 语言特征如分号、大括号组合等)
-	if strings.HasPrefix(text, "/*") && (strings.Contains(text, ";") || strings.Contains(text, "{")) {
-		return true
-	}
-
-	return false
-}
-
-// hasPlatformSpecificBuildTag 检查文件是否有平台专用的 build tag 或文件名后缀
-func (o *Obfuscator) hasPlatformSpecificBuildTag(node *ast.File) bool {
-	// 平台关键词列表
-	platformKeywords := []string{
-		"windows", "linux", "darwin", "freebsd", "openbsd",
-		"netbsd", "dragonfly", "solaris", "android", "aix",
-		"386", "amd64", "arm", "arm64", "mips", "mips64",
-		"ppc64", "ppc64le", "s390x", "wasm",
-	}
-
-	// 检查所有注释
-	for _, cg := range node.Comments {
-		for _, c := range cg.List {
-			text := c.Text
-			// 检查 //go:build 和 // +build 标签
-			if strings.HasPrefix(text, "//go:build") || strings.HasPrefix(text, "// +build") || strings.HasPrefix(text, "//+build") {
-				// 检查是否包含平台关键词
-				lowerText := strings.ToLower(text)
-				for _, keyword := range platformKeywords {
-					if strings.Contains(lowerText, keyword) {
-						return true
-					}
-				}
+	// 多行纯 C 代码块（cgo 前奏，常见于 import "C" 之前）：
+	// 保留含预处理指令行（#define/#ifdef/#pragma/#include/#cgo 等）或以分号/花括号
+	// 结尾的 C 代码，避免误删真正参与编译的宏/声明。
+	if strings.HasPrefix(text, "/*") {
+		for _, line := range strings.Split(text, "\n") {
+			if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "#") {
+				return true
 			}
 		}
-	}
-
-	return false
-}
-
-// isFilePlatformSpecific 检查文件是否平台特定（通过文件名后缀或build tag）
-func (o *Obfuscator) isFilePlatformSpecific(filePath string) bool {
-	// 检查文件名后缀
-	if o.hasPlatformSpecificSuffix(filePath) {
-		return true
-	}
-
-	// 检查build tag（需要解析文件）
-	node, err := parser.ParseFile(o.fset, filePath, nil, parser.ParseComments)
-	if err != nil {
-		return false // 解析失败，假设不是平台特定的
-	}
-
-	return o.hasPlatformSpecificBuildTag(node)
-}
-
-// hasPlatformSpecificSuffix 检查文件名是否有平台专用的后缀
-func (o *Obfuscator) hasPlatformSpecificSuffix(filePath string) bool {
-	// 获取文件名（不含扩展名）
-	base := filepath.Base(filePath)
-	nameWithoutExt := strings.TrimSuffix(base, ".go")
-
-	// 平台后缀列表
-	platformSuffixes := []string{
-		"_windows", "_linux", "_darwin", "_freebsd", "_openbsd",
-		"_netbsd", "_dragonfly", "_solaris", "_android", "_aix",
-		"_386", "_amd64", "_arm", "_arm64", "_mips", "_mips64",
-		"_ppc64", "_ppc64le", "_s390x", "_wasm",
-		// 组合后缀，如 _linux_amd64
-		"_windows_amd64", "_windows_386", "_windows_arm", "_windows_arm64",
-		"_linux_amd64", "_linux_386", "_linux_arm", "_linux_arm64",
-		"_darwin_amd64", "_darwin_arm64",
-	}
-
-	// 检查文件名是否以任何平台后缀结尾
-	for _, suffix := range platformSuffixes {
-		if strings.HasSuffix(nameWithoutExt, suffix) {
+		if strings.Contains(text, ";") || strings.Contains(text, "{") || strings.Contains(text, "}") {
 			return true
 		}
 	}
@@ -1694,269 +965,83 @@ func (o *Obfuscator) hasPlatformSpecificSuffix(filePath string) bool {
 	return false
 }
 
-// encryptStringsInAST 在 AST 中标记需要加密的字符串
-func (o *Obfuscator) encryptStringsInAST(node *ast.File) bool {
-	hadEncryption := false
-
-	// 收集需要跳过的字符串
-	skipLiterals := make(map[*ast.BasicLit]bool)
-
-	// 标记导入路径
-	for _, imp := range node.Imports {
-		if imp.Path != nil {
-			skipLiterals[imp.Path] = true
+// filterComments 过滤注释组，仅保留必要的编译指令类注释
+func (o *Obfuscator) filterComments(groups []*ast.CommentGroup) []*ast.CommentGroup {
+	var result []*ast.CommentGroup
+	for _, cg := range groups {
+		var keep []*ast.Comment
+		for _, c := range cg.List {
+			if o.shouldKeepComment(c.Text) {
+				keep = append(keep, c)
+			}
+		}
+		if len(keep) > 0 {
+			cg.List = keep
+			result = append(result, cg)
 		}
 	}
+	return result
+}
 
-	// 标记结构体标签
+// removeCommentsFromAST 移除 AST 中所有被过滤的注释
+//
+// 注意：go/format 打印时会同时读取 file.Comments 与节点上的 Doc/Comment 字段，
+// 仅清空 file.Comments 无法删除挂在节点上的注释（如类型/函数的 Doc 注释、结构体字段的尾注释），
+// 因此这里对节点上的注释组一并清理。
+func (o *Obfuscator) removeCommentsFromAST(node *ast.File) {
+	kept := o.filterComments(node.Comments)
+	keepSet := make(map[*ast.CommentGroup]bool, len(kept))
+	for _, cg := range kept {
+		keepSet[cg] = true
+	}
+
+	clearGroup := func(cg *ast.CommentGroup) bool {
+		return cg != nil && !keepSet[cg]
+	}
+
 	ast.Inspect(node, func(n ast.Node) bool {
-		if field, ok := n.(*ast.Field); ok {
-			if field.Tag != nil {
-				skipLiterals[field.Tag] = true
+		switch x := n.(type) {
+		case *ast.FuncDecl:
+			if clearGroup(x.Doc) {
+				x.Doc = nil
+			}
+		case *ast.GenDecl:
+			if clearGroup(x.Doc) {
+				x.Doc = nil
+			}
+		case *ast.Field:
+			if clearGroup(x.Doc) {
+				x.Doc = nil
+			}
+			if clearGroup(x.Comment) {
+				x.Comment = nil
+			}
+		case *ast.ImportSpec:
+			if clearGroup(x.Doc) {
+				x.Doc = nil
+			}
+			if clearGroup(x.Comment) {
+				x.Comment = nil
+			}
+		case *ast.ValueSpec:
+			if clearGroup(x.Doc) {
+				x.Doc = nil
+			}
+			if clearGroup(x.Comment) {
+				x.Comment = nil
+			}
+		case *ast.TypeSpec:
+			if clearGroup(x.Doc) {
+				x.Doc = nil
+			}
+			if clearGroup(x.Comment) {
+				x.Comment = nil
 			}
 		}
 		return true
 	})
 
-	// 检查是否有字符串需要加密
-	ast.Inspect(node, func(n ast.Node) bool {
-		if lit, ok := n.(*ast.BasicLit); ok {
-			if skipLiterals[lit] {
-				return true
-			}
-			if lit.Kind == token.STRING && len(lit.Value) > 2 {
-				if !strings.HasPrefix(lit.Value, "`") {
-					hadEncryption = true
-				}
-			}
-		}
-		return true
-	})
-
-	return hadEncryption
-}
-
-// ensureBase64ImportInSource 确保源代码中有 base64 导入
-func (o *Obfuscator) ensureBase64ImportInSource(source string) string {
-	if strings.Contains(source, `"encoding/base64"`) {
-		return source
-	}
-
-	lines := strings.Split(source, "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "import (") {
-			// 在 import 块中添加
-			lines[i] = line + "\n\t\"encoding/base64\""
-			return strings.Join(lines, "\n")
-		}
-		if strings.HasPrefix(strings.TrimSpace(line), "import ") {
-			// 单行 import，转换为块
-			lines[i] = "import (\n\t\"encoding/base64\"\n" + strings.TrimPrefix(line, "import ") + "\n)"
-			return strings.Join(lines, "\n")
-		}
-	}
-
-	// 没有找到 import，在 package 后添加
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "package ") {
-			lines = append(lines[:i+1], append([]string{"\nimport \"encoding/base64\"\n"}, lines[i+1:]...)...)
-			return strings.Join(lines, "\n")
-		}
-	}
-
-	return source
-}
-
-// encryptStringsInSource 在源代码中加密字符串
-func (o *Obfuscator) encryptStringsInSource(source string) (string, bool) {
-	lines := strings.Split(source, "\n")
-	result := make([]string, len(lines))
-
-	hadEncryption := false
-	inImportBlock := false
-	inConstBlock := false
-
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// 跟踪 import 块
-		if strings.HasPrefix(trimmed, "import (") {
-			inImportBlock = true
-			result[i] = line
-			continue
-		}
-		if inImportBlock && trimmed == ")" {
-			inImportBlock = false
-			result[i] = line
-			continue
-		}
-
-		// 跟踪 const 块
-		if strings.HasPrefix(trimmed, "const (") {
-			inConstBlock = true
-			result[i] = line
-			continue
-		}
-		if inConstBlock && trimmed == ")" {
-			inConstBlock = false
-			result[i] = line
-			continue
-		}
-
-		// 跳过特殊行
-		if inImportBlock || inConstBlock || strings.Contains(trimmed, "package ") ||
-			strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "const ") {
-			result[i] = line
-			continue
-		}
-
-		// 跳过结构体标签
-		if strings.Contains(line, "`") && strings.Contains(line, ":") {
-			result[i] = line
-			continue
-		}
-
-		// 处理行
-		newLine := line
-		inString := false
-		inRune := false
-		escaped := false
-		stringStart := -1
-
-		for j := 0; j < len(line); j++ {
-			ch := line[j]
-
-			if escaped {
-				escaped = false
-				continue
-			}
-
-			if ch == '\\' {
-				escaped = true
-				continue
-			}
-
-			// 处理单引号（rune）
-			if ch == '\'' && !inString {
-				if !inRune {
-					inRune = true
-				} else {
-					inRune = false
-				}
-				continue
-			}
-
-			// 只处理双引号
-			if ch == '"' && !inRune {
-				if !inString {
-					inString = true
-					stringStart = j
-				} else {
-					inString = false
-					if stringStart >= 0 {
-						strWithQuotes := line[stringStart : j+1]
-						if len(strWithQuotes) > 4 {
-							strContent := strWithQuotes[1 : len(strWithQuotes)-1]
-							if len(strContent) > 2 && !strings.Contains(strContent, "\\") {
-								encrypted := o.encryptString(strContent)
-								replacement := fmt.Sprintf(`%s("%s")`, o.decryptFuncName, encrypted)
-								newLine = strings.Replace(newLine, strWithQuotes, replacement, 1)
-								hadEncryption = true
-							}
-						}
-					}
-					stringStart = -1
-				}
-			}
-		}
-
-		result[i] = newLine
-	}
-
-	return strings.Join(result, "\n"), hadEncryption
-}
-
-// createDecryptPackage 创建独立的解密包
-func (o *Obfuscator) createDecryptPackage() error {
-	if o.decryptPkgCreated {
-		return nil
-	}
-
-	// 设置解密包路径（在输出目录下，而不是原始项目目录）
-	decryptPkgDir := filepath.Join(o.outputDir, o.decryptPkgName)
-	if err := os.MkdirAll(decryptPkgDir, 0755); err != nil {
-		return fmt.Errorf("创建解密包目录失败: %v", err)
-	}
-
-	// 生成解密包的内容
-	keyBytes := []byte(o.encryptionKey)
-	keyLiteral := "[]byte{"
-	for i, b := range keyBytes {
-		if i > 0 {
-			keyLiteral += ", "
-		}
-		keyLiteral += fmt.Sprintf("%d", b)
-	}
-	keyLiteral += "}"
-
-	// 创建解密包文件（不包含任何暴露用途的注释）
-	decryptFileContent := fmt.Sprintf(`package %s
-
-import "encoding/base64"
-
-func %s(s string) string {
-	d, e := base64.StdEncoding.DecodeString(s)
-	if e != nil {
-		return ""
-	}
-	k := %s
-	r := make([]byte, len(d))
-	for i, b := range d {
-		r[i] = b ^ k[i%%len(k)]
-	}
-	return string(r)
-}
-`, o.decryptPkgName, o.decryptFuncName, keyLiteral)
-
-	// 写入文件（使用随机文件名）
-	randomFileName := fmt.Sprintf("%s.go", generateRandomString(10))
-	decryptFilePath := filepath.Join(decryptPkgDir, randomFileName)
-	if err := ioutil.WriteFile(decryptFilePath, []byte(decryptFileContent), 0644); err != nil {
-		return fmt.Errorf("写入解密文件失败: %v", err)
-	}
-
-	// 读取go.mod获取模块名（从原始项目目录读取）
-	goModPath := filepath.Join(o.projectRoot, "go.mod")
-	goModContent, err := ioutil.ReadFile(goModPath)
-	if err != nil {
-		return fmt.Errorf("读取go.mod失败: %v", err)
-	}
-
-	// 解析模块名
-	moduleName := ""
-	lines := strings.Split(string(goModContent), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "module ") {
-			moduleName = strings.TrimSpace(strings.TrimPrefix(line, "module"))
-			break
-		}
-	}
-
-	if moduleName == "" {
-		return fmt.Errorf("无法从go.mod中获取模块名")
-	}
-
-	// 设置解密包的导入路径
-	o.decryptPkgPath = moduleName + "/" + o.decryptPkgName
-	o.decryptPkgCreated = true
-
-	// 保护解密函数名称和包名，防止被混淆
-	o.protectedNames[o.decryptFuncName] = true
-	o.packageNames[o.decryptPkgName] = true
-
-	log.Printf("[OK] 创建解密包: %s (导入路径: %s, 函数名: %s)", decryptPkgDir, o.decryptPkgPath, o.decryptFuncName)
-	return nil
+	node.Comments = kept
 }
 
 // ensureDecryptPackageImport 确保源代码中导入了解密包
@@ -1993,112 +1078,230 @@ func (o *Obfuscator) ensureDecryptPackageImport(source string) string {
 	return source
 }
 
-// encryptStringsInSourceWithPackage 在源代码中加密字符串（使用解密包）
-func (o *Obfuscator) encryptStringsInSourceWithPackage(source string) (string, bool) {
-	lines := strings.Split(source, "\n")
-	result := make([]string, len(lines))
-
-	hadEncryption := false
-	inImportBlock := false
-	inConstBlock := false
-
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// 跟踪 import 块
-		if strings.HasPrefix(trimmed, "import (") {
-			inImportBlock = true
-			result[i] = line
-			continue
-		}
-		if inImportBlock && trimmed == ")" {
-			inImportBlock = false
-			result[i] = line
-			continue
-		}
-
-		// 跟踪 const 块
-		if strings.HasPrefix(trimmed, "const (") {
-			inConstBlock = true
-			result[i] = line
-			continue
-		}
-		if inConstBlock && trimmed == ")" {
-			inConstBlock = false
-			result[i] = line
-			continue
-		}
-
-		// 跳过特殊行
-		if inImportBlock || inConstBlock || strings.Contains(trimmed, "package ") ||
-			strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "const ") {
-			result[i] = line
-			continue
-		}
-
-		// 跳过结构体标签
-		if strings.Contains(line, "`") && strings.Contains(line, ":") {
-			result[i] = line
-			continue
-		}
-
-		// 处理行
-		newLine := line
-		inString := false
-		inRune := false
-		escaped := false
-		stringStart := -1
-
-		for j := 0; j < len(line); j++ {
-			ch := line[j]
-
-			if escaped {
-				escaped = false
-				continue
-			}
-
-			if ch == '\\' {
-				escaped = true
-				continue
-			}
-
-			// 处理单引号（rune）
-			if ch == '\'' && !inString {
-				if !inRune {
-					inRune = true
-				} else {
-					inRune = false
-				}
-				continue
-			}
-
-			// 只处理双引号
-			if ch == '"' && !inRune {
-				if !inString {
-					inString = true
-					stringStart = j
-				} else {
-					inString = false
-					if stringStart >= 0 {
-						strWithQuotes := line[stringStart : j+1]
-						if len(strWithQuotes) > 4 {
-							strContent := strWithQuotes[1 : len(strWithQuotes)-1]
-							if len(strContent) > 2 && !strings.Contains(strContent, "\\") {
-								encrypted := o.encryptString(strContent)
-								// 使用解密包的函数: pkgName.FuncName("encrypted")
-								replacement := fmt.Sprintf(`%s.%s("%s")`, o.decryptPkgName, o.decryptFuncName, encrypted)
-								newLine = strings.Replace(newLine, strWithQuotes, replacement, 1)
-								hadEncryption = true
-							}
-						}
-					}
-					stringStart = -1
-				}
-			}
-		}
-
-		result[i] = newLine
+// encryptStringsInSource 在源代码中加密字符串字面量（使用解密包的函数），返回修改后的源码和加密数量。
+// 基于 AST 精确定位字符串，天然排除注释、导入路径、结构体标签与 const 常量的字符串，
+// 不会破坏注释内容，也没有逐行解析时的状态泄漏问题（如反引号跨越、注释内引号等）。
+func (o *Obfuscator) encryptStringsInSource(source string) (string, int) {
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "", source, parser.ParseComments)
+	if err != nil {
+		logger.Warnf("字符串加密: 解析源码失败，跳过: %v", err)
+		return source, 0
 	}
 
-	return strings.Join(result, "\n"), hadEncryption
+	// 收集需要跳过的字符串：导入路径、结构体标签、常量上下文中的字符串
+	// （const 初始化表达式、数组长度表达式），这些位置必须是常量表达式，
+	// 不能被解密函数调用替换。
+	skipLiterals := make(map[*ast.BasicLit]bool)
+	for _, imp := range node.Imports {
+		if imp.Path != nil {
+			skipLiterals[imp.Path] = true
+		}
+	}
+
+	// markSubtreeStrings 将表达式子树内所有字符串字面量标记为跳过
+	markSubtreeStrings := func(expr ast.Expr) {
+		ast.Inspect(expr, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				skipLiterals[lit] = true
+			}
+			return true
+		})
+	}
+
+	ast.Inspect(node, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.Field:
+			if x.Tag != nil {
+				skipLiterals[x.Tag] = true
+			}
+		case *ast.GenDecl:
+			// const 的值必须是常量表达式，递归标记整个初始化表达式中的字符串
+			if x.Tok == token.CONST {
+				for _, spec := range x.Specs {
+					if vs, ok := spec.(*ast.ValueSpec); ok {
+						for _, val := range vs.Values {
+							markSubtreeStrings(val)
+						}
+					}
+				}
+				return true
+			}
+		case *ast.ArrayType:
+			// 数组长度必须是常量表达式
+			if x.Len != nil {
+				markSubtreeStrings(x.Len)
+			}
+		}
+		return true
+	})
+
+	// 收集可加密的字符串及其字节区间
+	type replacement struct {
+		start, end int
+		text       string
+	}
+	var repls []replacement
+
+	ast.Inspect(node, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok {
+			return true
+		}
+		if skipLiterals[lit] {
+			return true
+		}
+		// 仅双引号字符串；跳过原始字符串（反引号）与含转义的字符串
+		if lit.Kind != token.STRING || len(lit.Value) < 3 || lit.Value[0] != '"' {
+			return true
+		}
+		content, err := strconv.Unquote(lit.Value)
+		if err != nil || len(content) < 3 || strings.Contains(content, "\\") {
+			return true
+		}
+
+		// 随机选择解密策略（与生成包中的解密函数一一对应）
+		strategy := decryptStrategy(MascotRandInt(numDecryptStrategies))
+		decryptName := o.decryptFuncNames[strategy]
+
+		pos := fset.Position(lit.Pos())
+		end := fset.Position(lit.End())
+		encryptedText := o.encryptStringWithStrategy(content, strategy)
+		repls = append(repls, replacement{
+			start: pos.Offset,
+			end:   end.Offset,
+			text:  fmt.Sprintf(`%s.%s("%s")`, o.decryptPkgName, decryptName, encryptedText),
+		})
+		return true
+	})
+
+	if len(repls) == 0 {
+		return source, 0
+	}
+
+	// 按原始字节偏移拼接替换（替换文本比字面量更长也安全）
+	var sb strings.Builder
+	last := 0
+	for _, r := range repls {
+		sb.WriteString(source[last:r.start])
+		sb.WriteString(r.text)
+		last = r.end
+	}
+	sb.WriteString(source[last:])
+
+	newSource := sb.String()
+	newSource = o.ensureDecryptPackageImport(newSource)
+	// 重新格式化，修复文本级导入注入导致的缩进问题
+	if formatted, err := format.Source([]byte(newSource)); err == nil {
+		newSource = string(formatted)
+	}
+	return newSource, len(repls)
+}
+
+// createDecryptPackage 创建独立的解密包
+func (o *Obfuscator) createDecryptPackage() error {
+	if o.decryptPkgCreated {
+		return nil
+	}
+
+	// 设置解密包路径（在输出目录下，而不是原始项目目录）
+	decryptPkgDir := filepath.Join(o.outputDir, o.decryptPkgName)
+	if err := os.MkdirAll(decryptPkgDir, 0755); err != nil {
+		return fmt.Errorf("创建解密包目录失败: %v", err)
+	}
+
+	// 生成解密包的内容（每种策略对应一个独立函数）
+	keyBytes := []byte(o.encryptionKey)
+	keyLiteral := "[]byte{"
+	for i, b := range keyBytes {
+		if i > 0 {
+			keyLiteral += ", "
+		}
+		keyLiteral += fmt.Sprintf("%d", b)
+	}
+	keyLiteral += "}"
+
+	decryptImpl := map[decryptStrategy]string{
+		strategyXOR: `
+	d, e := base64.StdEncoding.DecodeString(s)
+	if e != nil {
+		return ""
+	}
+	k := %s
+	r := make([]byte, len(d))
+	for i, b := range d {
+		r[i] = b ^ k[i%%len(k)]
+	}
+	return string(r)
+`,
+		strategyXORAdd: `
+	d, e := base64.StdEncoding.DecodeString(s)
+	if e != nil {
+		return ""
+	}
+	k := %s
+	r := make([]byte, len(d))
+	for i, b := range d {
+		r[i] = (b - byte(i&0xff)) ^ k[i%%len(k)]
+	}
+	return string(r)
+`,
+		strategyXORRot: `
+	d, e := base64.StdEncoding.DecodeString(s)
+	if e != nil {
+		return ""
+	}
+	k := %s
+	r := make([]byte, len(d))
+	for i, b := range d {
+		r[i] = func() byte {
+			v := b ^ k[i%%len(k)]
+			shift := uint(k[i%%len(k)]) %% 8
+			return (v >> shift) | (v << (8 - shift))
+		}()
+	}
+	return string(r)
+`,
+	}
+
+	var funcs strings.Builder
+	for i := 0; i < numDecryptStrategies; i++ {
+		fmt.Fprintf(&funcs, "func %s(s string) string {\n%s}\n\n",
+			o.decryptFuncNames[i],
+			fmt.Sprintf(decryptImpl[decryptStrategy(i)], keyLiteral))
+	}
+
+	// 创建解密包文件（不包含任何暴露用途的注释）
+	decryptFileContent := fmt.Sprintf(`package %s
+
+import "encoding/base64"
+
+%s`, o.decryptPkgName, funcs.String())
+
+	// 写入文件（使用随机文件名）
+	randomFileName := generateRandomString(10) + ".go"
+	decryptFilePath := filepath.Join(decryptPkgDir, randomFileName)
+	if err := os.WriteFile(decryptFilePath, []byte(decryptFileContent), 0644); err != nil {
+		return fmt.Errorf("写入解密文件失败: %v", err)
+	}
+
+	// 读取 go.mod 获取模块名（从原始项目目录读取）
+	moduleName, err := readModuleNameFromFile(filepath.Join(o.projectRoot, "go.mod"))
+	if err != nil {
+		return fmt.Errorf("读取go.mod失败: %v", err)
+	}
+
+	// 设置解密包的导入路径
+	o.decryptPkgPath = moduleName + "/" + o.decryptPkgName
+	o.decryptPkgCreated = true
+
+	// 保护解密函数名称和包名，防止被混淆
+	o.protectedNames[o.decryptFuncName] = true
+	for _, name := range o.decryptFuncNames {
+		o.protectedNames[name] = true
+	}
+	o.packageNames[o.decryptPkgName] = true
+
+	logger.Infof("创建解密包: %s (导入路径: %s, 函数名: %s)", decryptPkgDir, o.decryptPkgPath, o.decryptFuncName)
+	return nil
 }

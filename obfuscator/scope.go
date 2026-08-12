@@ -7,24 +7,24 @@ import (
 
 // Scope 表示一个作用域
 type Scope struct {
-	Parent   *Scope                // 父作用域
-	Children []*Scope              // 子作用域
-	Objects  map[string]*Object    // 该作用域中定义的对象
-	Node     ast.Node              // 关联的AST节点
-	Start    token.Pos             // 作用域起始位置
-	End      token.Pos             // 作用域结束位置
+	Parent   *Scope             // 父作用域
+	Children []*Scope           // 子作用域
+	Objects  map[string]*Object // 该作用域中定义的对象
+	Node     ast.Node           // 关联的AST节点
+	Start    token.Pos          // 作用域起始位置
+	End      token.Pos          // 作用域结束位置
 }
 
 // Object 表示一个声明的对象（变量、函数等）
 type Object struct {
-	Name         string      // 原始名称
-	ObfuscatedName string    // 混淆后的名称
-	Kind         ObjectKind  // 对象类型
-	Decl         ast.Node    // 声明节点
-	Scope        *Scope      // 所属作用域
-	IsExported   bool        // 是否导出
-	Pos          token.Pos   // 声明位置
-	FilePath     string      // 对象所在的文件路径（用于生成唯一标识）
+	Name           string     // 原始名称
+	ObfuscatedName string     // 混淆后的名称
+	Kind           ObjectKind // 对象类型
+	Decl           ast.Node   // 声明节点
+	Scope          *Scope     // 所属作用域
+	IsExported     bool       // 是否导出
+	Pos            token.Pos  // 声明位置
+	FilePath       string     // 对象所在的文件路径（用于生成唯一标识）
 }
 
 // ObjectKind 对象类型
@@ -48,7 +48,7 @@ type ScopeAnalyzer struct {
 	currentScope *Scope
 	fileScope    *Scope
 	packageScope *Scope
-	scopes       map[ast.Node]*Scope // AST节点到作用域的映射
+	scopes       map[ast.Node]*Scope   // AST节点到作用域的映射
 	objects      map[token.Pos]*Object // 位置到对象的映射
 }
 
@@ -57,7 +57,7 @@ func NewScopeAnalyzer(fset *token.FileSet) *ScopeAnalyzer {
 	packageScope := &Scope{
 		Objects: make(map[string]*Object),
 	}
-	
+
 	return &ScopeAnalyzer{
 		fset:         fset,
 		packageScope: packageScope,
@@ -71,7 +71,7 @@ func NewScopeAnalyzer(fset *token.FileSet) *ScopeAnalyzer {
 func (sa *ScopeAnalyzer) Analyze(file *ast.File) {
 	sa.fileScope = sa.newScope(file)
 	sa.currentScope = sa.fileScope
-	
+
 	// 遍历所有声明
 	for _, decl := range file.Decls {
 		sa.analyzeDecl(decl)
@@ -81,20 +81,20 @@ func (sa *ScopeAnalyzer) Analyze(file *ast.File) {
 // newScope 创建新的作用域
 func (sa *ScopeAnalyzer) newScope(node ast.Node) *Scope {
 	scope := &Scope{
-		Parent:   sa.currentScope,
-		Objects:  make(map[string]*Object),
-		Node:     node,
+		Parent:  sa.currentScope,
+		Objects: make(map[string]*Object),
+		Node:    node,
 	}
-	
+
 	if node != nil {
 		scope.Start = node.Pos()
 		scope.End = node.End()
 	}
-	
+
 	if sa.currentScope != nil {
 		sa.currentScope.Children = append(sa.currentScope.Children, scope)
 	}
-	
+
 	sa.scopes[node] = scope
 	return scope
 }
@@ -123,7 +123,7 @@ func (sa *ScopeAnalyzer) declareObject(name string, kind ObjectKind, decl ast.No
 		IsExported: isExported(name),
 		Pos:        pos,
 	}
-	
+
 	sa.currentScope.Objects[name] = obj
 	sa.objects[pos] = obj
 	return obj
@@ -145,32 +145,44 @@ func (sa *ScopeAnalyzer) analyzeFuncDecl(decl *ast.FuncDecl) {
 	if decl.Recv == nil {
 		sa.declareObject(decl.Name.Name, ObjFunc, decl, decl.Name.Pos())
 	}
-	
+
 	// 进入函数作用域
 	funcScope := sa.enterScope(decl)
-	
+
 	// 分析接收者
 	if decl.Recv != nil {
 		sa.analyzeFieldList(decl.Recv, ObjVar)
 	}
-	
+
 	// 分析参数
 	if decl.Type.Params != nil {
 		sa.analyzeFieldList(decl.Type.Params, ObjVar)
 	}
-	
+
 	// 分析返回值
 	if decl.Type.Results != nil {
 		sa.analyzeFieldList(decl.Type.Results, ObjVar)
 	}
-	
-	// 分析函数体
+
+	// 分析函数体（直接在当前作用域内分析，参数/返回值与函数体同作用域，
+	// 这样 := 对命名返回值/参数的复用才能解析到同一个对象）
 	if decl.Body != nil {
-		sa.analyzeBlockStmt(decl.Body)
+		sa.analyzeBlockStmtInPlace(decl.Body)
 	}
-	
+
 	sa.leaveScope()
 	_ = funcScope
+}
+
+// analyzeBlockStmtInPlace 分析块语句，但不为块本身创建新作用域
+// （用于函数体：Go 中函数体与参数/返回值共享同一个作用域）
+func (sa *ScopeAnalyzer) analyzeBlockStmtInPlace(block *ast.BlockStmt) {
+	if block == nil {
+		return
+	}
+	for _, stmt := range block.List {
+		sa.analyzeStmt(stmt)
+	}
 }
 
 // analyzeGenDecl 分析通用声明
@@ -189,7 +201,7 @@ func (sa *ScopeAnalyzer) analyzeGenDecl(decl *ast.GenDecl) {
 			for _, value := range s.Values {
 				sa.analyzeExpr(value)
 			}
-			
+
 		case *ast.TypeSpec:
 			sa.declareObject(s.Name.Name, ObjType, s, s.Name.Pos())
 			sa.analyzeExpr(s.Type)
@@ -202,7 +214,7 @@ func (sa *ScopeAnalyzer) analyzeFieldList(fields *ast.FieldList, kind ObjectKind
 	if fields == nil {
 		return
 	}
-	
+
 	for _, field := range fields.List {
 		for _, name := range field.Names {
 			sa.declareObject(name.Name, kind, field, name.Pos())
@@ -215,11 +227,11 @@ func (sa *ScopeAnalyzer) analyzeFieldList(fields *ast.FieldList, kind ObjectKind
 func (sa *ScopeAnalyzer) analyzeBlockStmt(block *ast.BlockStmt) {
 	// 块语句创建新作用域
 	sa.enterScope(block)
-	
+
 	for _, stmt := range block.List {
 		sa.analyzeStmt(stmt)
 	}
-	
+
 	sa.leaveScope()
 }
 
@@ -228,18 +240,22 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 	if stmt == nil {
 		return
 	}
-	
+
 	switch s := stmt.(type) {
 	case *ast.DeclStmt:
 		sa.analyzeDecl(s.Decl)
-		
+
 	case *ast.AssignStmt:
 		// 分析赋值语句
 		for i, lhs := range s.Lhs {
 			if s.Tok == token.DEFINE {
 				// 短变量声明 :=
+				// 按照 Go 语义：同一作用域内已声明的变量被复用（不新建对象），
+				// 只有新变量才会声明。否则命名返回值等复用场景会被误判为遮蔽。
 				if ident, ok := lhs.(*ast.Ident); ok && ident.Name != "_" {
-					sa.declareObject(ident.Name, ObjVar, s, ident.Pos())
+					if _, exists := sa.currentScope.Objects[ident.Name]; !exists {
+						sa.declareObject(ident.Name, ObjVar, s, ident.Pos())
+					}
 				}
 			}
 			if i < len(s.Rhs) {
@@ -249,7 +265,7 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 		for _, lhs := range s.Lhs {
 			sa.analyzeExpr(lhs)
 		}
-		
+
 	case *ast.IfStmt:
 		sa.enterScope(s)
 		if s.Init != nil {
@@ -261,7 +277,7 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 			sa.analyzeStmt(s.Else)
 		}
 		sa.leaveScope()
-		
+
 	case *ast.ForStmt:
 		sa.enterScope(s)
 		if s.Init != nil {
@@ -275,7 +291,7 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 		}
 		sa.analyzeBlockStmt(s.Body)
 		sa.leaveScope()
-		
+
 	case *ast.RangeStmt:
 		sa.enterScope(s)
 		if s.Tok == token.DEFINE {
@@ -289,7 +305,7 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 		sa.analyzeExpr(s.X)
 		sa.analyzeBlockStmt(s.Body)
 		sa.leaveScope()
-		
+
 	case *ast.SwitchStmt:
 		sa.enterScope(s)
 		if s.Init != nil {
@@ -313,7 +329,7 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 			}
 		}
 		sa.leaveScope()
-		
+
 	case *ast.TypeSwitchStmt:
 		sa.enterScope(s)
 		if s.Init != nil {
@@ -335,7 +351,7 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 			}
 		}
 		sa.leaveScope()
-		
+
 	case *ast.SelectStmt:
 		sa.enterScope(s)
 		if s.Body != nil {
@@ -353,34 +369,34 @@ func (sa *ScopeAnalyzer) analyzeStmt(stmt ast.Stmt) {
 			}
 		}
 		sa.leaveScope()
-		
+
 	case *ast.BlockStmt:
 		sa.analyzeBlockStmt(s)
-		
+
 	case *ast.ExprStmt:
 		sa.analyzeExpr(s.X)
-		
+
 	case *ast.SendStmt:
 		sa.analyzeExpr(s.Chan)
 		sa.analyzeExpr(s.Value)
-		
+
 	case *ast.IncDecStmt:
 		sa.analyzeExpr(s.X)
-		
+
 	case *ast.ReturnStmt:
 		for _, expr := range s.Results {
 			sa.analyzeExpr(expr)
 		}
-		
+
 	case *ast.BranchStmt:
 		// break, continue, goto, fallthrough
-		
+
 	case *ast.GoStmt:
 		sa.analyzeExpr(s.Call)
-		
+
 	case *ast.DeferStmt:
 		sa.analyzeExpr(s.Call)
-		
+
 	case *ast.LabeledStmt:
 		sa.analyzeStmt(s.Stmt)
 	}
@@ -391,7 +407,7 @@ func (sa *ScopeAnalyzer) analyzeExpr(expr ast.Expr) {
 	if expr == nil {
 		return
 	}
-	
+
 	switch e := expr.(type) {
 	case *ast.FuncLit:
 		// 函数字面量创建新作用域
@@ -402,10 +418,10 @@ func (sa *ScopeAnalyzer) analyzeExpr(expr ast.Expr) {
 		if e.Type.Results != nil {
 			sa.analyzeFieldList(e.Type.Results, ObjVar)
 		}
-		sa.analyzeBlockStmt(e.Body)
+		sa.analyzeBlockStmtInPlace(e.Body)
 		sa.leaveScope()
 		_ = funcScope
-		
+
 	case *ast.CompositeLit:
 		sa.analyzeExpr(e.Type)
 		for _, elt := range e.Elts {
@@ -416,24 +432,24 @@ func (sa *ScopeAnalyzer) analyzeExpr(expr ast.Expr) {
 				sa.analyzeExpr(elt)
 			}
 		}
-		
+
 	case *ast.BinaryExpr:
 		sa.analyzeExpr(e.X)
 		sa.analyzeExpr(e.Y)
-		
+
 	case *ast.UnaryExpr:
 		sa.analyzeExpr(e.X)
-		
+
 	case *ast.CallExpr:
 		sa.analyzeExpr(e.Fun)
 		for _, arg := range e.Args {
 			sa.analyzeExpr(arg)
 		}
-		
+
 	case *ast.IndexExpr:
 		sa.analyzeExpr(e.X)
 		sa.analyzeExpr(e.Index)
-		
+
 	case *ast.SliceExpr:
 		sa.analyzeExpr(e.X)
 		if e.Low != nil {
@@ -445,33 +461,33 @@ func (sa *ScopeAnalyzer) analyzeExpr(expr ast.Expr) {
 		if e.Max != nil {
 			sa.analyzeExpr(e.Max)
 		}
-		
+
 	case *ast.SelectorExpr:
 		sa.analyzeExpr(e.X)
-		
+
 	case *ast.StarExpr:
 		sa.analyzeExpr(e.X)
-		
+
 	case *ast.TypeAssertExpr:
 		sa.analyzeExpr(e.X)
 		if e.Type != nil {
 			sa.analyzeExpr(e.Type)
 		}
-		
+
 	case *ast.ParenExpr:
 		sa.analyzeExpr(e.X)
-		
+
 	case *ast.ArrayType:
 		if e.Len != nil {
 			sa.analyzeExpr(e.Len)
 		}
 		sa.analyzeExpr(e.Elt)
-		
+
 	case *ast.StructType:
 		if e.Fields != nil {
 			sa.analyzeFieldList(e.Fields, ObjField)
 		}
-		
+
 	case *ast.FuncType:
 		if e.Params != nil {
 			sa.analyzeFieldList(e.Params, ObjVar)
@@ -479,64 +495,19 @@ func (sa *ScopeAnalyzer) analyzeExpr(expr ast.Expr) {
 		if e.Results != nil {
 			sa.analyzeFieldList(e.Results, ObjVar)
 		}
-		
+
 	case *ast.InterfaceType:
 		if e.Methods != nil {
 			sa.analyzeFieldList(e.Methods, ObjMethod)
 		}
-		
+
 	case *ast.MapType:
 		sa.analyzeExpr(e.Key)
 		sa.analyzeExpr(e.Value)
-		
+
 	case *ast.ChanType:
 		sa.analyzeExpr(e.Value)
 	}
-}
-
-// LookupObject 在作用域链中查找对象
-func (s *Scope) LookupObject(name string) *Object {
-	for scope := s; scope != nil; scope = scope.Parent {
-		if obj, ok := scope.Objects[name]; ok {
-			return obj
-		}
-	}
-	return nil
-}
-
-// GetScopeAt 获取指定位置的作用域
-func (sa *ScopeAnalyzer) GetScopeAt(pos token.Pos) *Scope {
-	// 从当前作用域开始向上查找
-	for scope := sa.currentScope; scope != nil; scope = scope.Parent {
-		if pos >= scope.Start && pos <= scope.End {
-			// 检查子作用域
-			for _, child := range scope.Children {
-				if pos >= child.Start && pos <= child.End {
-					return sa.getScopeAtInTree(child, pos)
-				}
-			}
-			return scope
-		}
-	}
-	return sa.fileScope
-}
-
-// getScopeAtInTree 在作用域树中递归查找
-func (sa *ScopeAnalyzer) getScopeAtInTree(scope *Scope, pos token.Pos) *Scope {
-	if pos < scope.Start || pos > scope.End {
-		return nil
-	}
-	
-	// 检查子作用域
-	for _, child := range scope.Children {
-		if pos >= child.Start && pos <= child.End {
-			if result := sa.getScopeAtInTree(child, pos); result != nil {
-				return result
-			}
-		}
-	}
-	
-	return scope
 }
 
 // GetFileScope 获取文件作用域
@@ -549,3 +520,49 @@ func (sa *ScopeAnalyzer) GetPackageScope() *Scope {
 	return sa.packageScope
 }
 
+// findScopeAt 返回包含指定位置 pos 的最深作用域（从当前作用域开始向下搜索）
+func (sa *ScopeAnalyzer) findScopeAt(pos token.Pos, scope *Scope) *Scope {
+	if scope == nil {
+		return nil
+	}
+	// 检查 pos 是否在 scope 的范围内
+	// 文件作用域的 End 可能为 0（无法精确定位文件结束），此时用子作用域判断
+	if scope.Start <= pos {
+		// 在子作用域中查找最深匹配
+		var best *Scope
+		for _, child := range scope.Children {
+			if child.Start <= pos && pos < child.End {
+				if found := sa.findScopeAt(pos, child); found != nil {
+					best = found
+				}
+			}
+		}
+		if best != nil {
+			return best
+		}
+		// 如果没有子作用域匹配，但 pos 在当前作用域范围内，返回当前作用域
+		if scope.Start <= pos && (scope.End == 0 || pos < scope.End) {
+			return scope
+		}
+	}
+	return nil
+}
+
+// ResolveIdent 解析标识符 pos 对应的对象，按最内层作用域优先查找（正确处理遮蔽）。
+// 遵循 Go 语义：局部变量在声明之后才可见（同一块内声明之前的引用绑定到外层对象）。
+func (sa *ScopeAnalyzer) ResolveIdent(pos token.Pos, name string) *Object {
+	scope := sa.findScopeAt(pos, sa.fileScope)
+	for s := scope; s != nil; s = s.Parent {
+		if obj, ok := s.Objects[name]; ok {
+			// 文件作用域的对象整个文件可见（包级变量/函数支持前向引用），
+			// 不应用声明顺序过滤；仅对局部对象应用：声明位置之后才可见。
+			if s != sa.fileScope {
+				if obj.Pos > pos {
+					continue
+				}
+			}
+			return obj
+		}
+	}
+	return nil
+}

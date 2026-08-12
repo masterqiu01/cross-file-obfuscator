@@ -1,25 +1,52 @@
 package obfuscator
 
 import (
-	"crypto/rand"
-	"log"
-	"math/big"
+	crand "crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"math/rand/v2"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
+
+	"cross-file-obfuscator/internal/logger"
 )
+
+// 全局随机数生成器（crypto 强随机种子，math/rand 高速生成）
+// 用途：生成混淆标识符、随机文件名、垃圾代码的随机数值等非机密场景
+var rng = rand.New(rand.NewPCG(seedUint64(), seedUint64()))
+
+func seedUint64() uint64 {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return uint64(time.Now().UnixNano())
+	}
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+var moduleNameRe = regexp.MustCompile(`(?m)^module\s+([^\s]+)`)
+
+// readModuleNameFromFile 从 go.mod 文件中读取模块名
+func readModuleNameFromFile(goModPath string) (string, error) {
+	data, err := os.ReadFile(goModPath)
+	if err != nil {
+		return "", err
+	}
+	m := moduleNameRe.FindSubmatch(data)
+	if len(m) < 2 {
+		return "", fmt.Errorf("go.mod 中未找到 module 声明")
+	}
+	return string(m[1]), nil
+}
 
 // generateRandomString 生成随机字母数字字符串
 func generateRandomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	result := make([]byte, length)
 	for i := range result {
-		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
-		if err != nil {
-			log.Printf("Warning: Failed to generate random number: %v, using fallback", err)
-			result[i] = charset[i%len(charset)]
-			continue
-		}
-		result[i] = charset[num.Int64()]
+		result[i] = charset[rng.IntN(len(charset))]
 	}
 	return string(result)
 }
@@ -125,7 +152,7 @@ func (o *Obfuscator) isGeneratedFile(path string) bool {
 func (o *Obfuscator) isExcluded(path string) bool {
 	excluded, reason := o.shouldExcludeFile(path)
 	if excluded {
-		log.Printf("排查功能: 排除文件 %s (原因: %s)", path, reason)
+		logger.Debugf("排查功能: 排除文件 %s (原因: %s)", path, reason)
 	}
 	return excluded
 }

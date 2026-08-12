@@ -3,10 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 
+	"cross-file-obfuscator/internal/logger"
 	"cross-file-obfuscator/obfuscator"
 )
 
@@ -22,7 +22,7 @@ func printLogo() {
 	fmt.Println("     \033[1;33m━━━ File Obfuscator ━━━\033[0m")
 	fmt.Println()
 	fmt.Println("       \033[90mGo 代码混淆与保护工具\033[0m")
-	fmt.Println("       \033[90mVersion 1.0.4 | By  masterqiu01\033[0m")
+	fmt.Println("       \033[90mVersion 1.0.5 | By  masterqiu01\033[0m")
 	fmt.Println()
 }
 
@@ -38,11 +38,11 @@ func checkAndHandleExistingDir(outDir string) error {
 		response = strings.ToLower(strings.TrimSpace(response))
 
 		if response == "y" || response == "yes" {
-			fmt.Printf("正在删除目录: %s\n", outDir)
+			logger.Infof("正在删除目录: %s", outDir)
 			if err := os.RemoveAll(outDir); err != nil {
 				return fmt.Errorf("删除目录失败: %v", err)
 			}
-			fmt.Println("\033[32m[OK] 目录已删除\033[0m")
+			logger.Infof("目录已删除")
 		} else {
 			return fmt.Errorf("用户取消操作")
 		}
@@ -59,10 +59,15 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("\033[1m■ 源码混淆选项 (配合 -source):\033[0m")
 	fmt.Println("  -o string                   输出目录 (默认: '项目名_obfuscated')")
-	fmt.Println("  -encrypt-strings            加密所有字符串字面量 (运行时解密)")
-	fmt.Println("  -inject-junk                注入随机化的垃圾代码和不透明谓词")
+	fmt.Println("  -encrypt-strings            加密字符串字面量 (3 种随机加密策略 + 独立解密包，")
+	fmt.Println("                              运行时解密；自动跳过导入路径/结构体标签/const/反引号原始串等)")
+	fmt.Println("  -inject-junk                注入随机化的垃圾代码和不透明谓词 (含锚点防折叠)")
 	fmt.Println("  -obfuscate-filenames        混淆 .go 源代码文件名")
+	fmt.Println("  -obfuscate-positions        用 //line 伪文件名混淆源码位置信息 (栈追踪伪装)")
 	fmt.Println("  -obfuscate-exported         混淆导出函数名 (注意: 可能破坏外部引用)")
+	fmt.Println("  -preserve-reflection        保留反射/JSON 实际引用的类型与字段")
+	fmt.Println("                              (默认: true，精确到被引用的类型，静态不可达处整文件保护)")
+	fmt.Println("  -skip-generated             跳过自动生成的代码文件 (*.pb.go 等, 默认: true)")
 	fmt.Println("  -remove-comments            移除代码注释 (默认: true)")
 	fmt.Println("  -exclude string             排除特定文件/目录模式 (逗号分隔, 如 '*_test.go,internal/*')")
 	fmt.Println("  -dry-run                    干跑模式：只打印将要混淆的内容，不实际写入任何文件")
@@ -75,33 +80,56 @@ func printUsage() {
 	fmt.Println("  -obfuscate-third-party      混淆第三方依赖包 (如 github.com/xxx，谨慎使用)")
 	fmt.Println("  -only-project               仅混淆项目自身包，保留标准库 (增强 Windows 兼容性)")
 	fmt.Println("  -disable-pclntab            仅执行基础符号操作，不修改 pclntab 结构")
-	fmt.Println("  -obfuscate-paths            混淆二进制中残留的 .go 源文件绝对路径 (极力推荐)")
+	fmt.Println("  -obfuscate-paths            混淆二进制中残留的 .go 源文件绝对路径 (默认: true, 极力推荐)")
+	fmt.Println()
+	fmt.Println("\033[1m■ 全局选项:\033[0m")
+	fmt.Println("  -log-level string            日志级别 (debug/info/warn/error, 默认: info)")
+	fmt.Println("  -h, --help                    显示帮助信息")
 	fmt.Println()
 	fmt.Println("\033[1m■ 常见使用场景:\033[0m")
-	
-	fmt.Println("  \033[36m1. 源码混淆 (适用于交付源码)\033[0m")
-	fmt.Println("  功能: 混淆文件名，加密字符串，注入控制流混淆代码。")
-	fmt.Println("  命令:")
-	fmt.Println("    ./cross-file-obfuscator -source -encrypt-strings -inject-junk -obfuscate-filenames -o out_src ./my_project")
+	fmt.Println("  下面命令中的 ./my_project、app.exe 换成你自己的目录/文件即可直接使用。")
+
 	fmt.Println()
-	
-	fmt.Println("  \033[36m2. 二进制全量混淆 (推荐)\033[0m")
-	fmt.Println("  功能: 读取 go.mod 自动混淆所有项目包与第三方包，移除可读文件路径。")
-	fmt.Println("  命令: (需在包含 go.mod 的目录下执行)")
-	fmt.Println("    go build -trimpath -o app.exe")
-	fmt.Println("    ./cross-file-obfuscator -binary -auto-discover-pkgs -obfuscate-third-party app.exe")
+	fmt.Println("  \033[36m场景 1: 交付前全量源码混淆 (推荐)\033[0m")
+	fmt.Println("  适用: 把整套源码交付给第三方，不想让对方直接看懂业务逻辑。")
+	fmt.Println("  效果: 生成一份全新的可编译项目 (默认输出到 my_project_obfuscated/)，")
+	fmt.Println("        文件名、字符串、函数名/变量名全部乱码，并混入垃圾代码干扰阅读。")
+	fmt.Println("  流程:")
+	fmt.Println("    1) 混淆源码:")
+	fmt.Println("       ./cross-file-obfuscator -source -encrypt-strings -inject-junk \\")
+	fmt.Println("           -obfuscate-filenames -obfuscate-positions ./my_project")
+	fmt.Println("    2) 进到输出目录编译，验证生成物可正常构建即可交付:")
+	fmt.Println("       cd my_project_obfuscated && go build ./...")
 	fmt.Println()
-	
-	fmt.Println("  \033[36m3. 最小化二进制混淆 (降低杀软误报)\033[0m")
-	fmt.Println("  功能: 仅对项目自身包进行混淆，保留原生标准库特征。")
-	fmt.Println("  命令:")
-	fmt.Println("    ./cross-file-obfuscator -source -encrypt-strings ./my_project")
-	fmt.Println("    cd ./my_project_obfuscated && go build -trimpath -ldflags=\"-s -w\" -o app.exe")
-	fmt.Println("    ./cross-file-obfuscator -binary -auto-discover-pkgs -only-project app.exe")
+
+	fmt.Println("  \033[36m场景 2: 仅交付二进制，做全量混淆\033[0m")
+	fmt.Println("  适用: 只给对方可执行文件，同时连标准库/第三方库的符号也一并打乱。")
+	fmt.Println("  效果: pclntab 里的包名、函数名、文件路径全部替换，string 命令几乎看不到")
+	fmt.Println("        可读信息。混淆力度最大。用 -project 指定源码目录后，可在任意位置执行。")
+	fmt.Println("  流程:")
+	fmt.Println("    1) 在项目目录里编译出二进制:")
+	fmt.Println("       cd /path/to/my_project && go build -trimpath -o app.exe")
+	fmt.Println("    2) 回到任意目录，用 -project 指到源码，对二进制做全量混淆 (会原地修改 app.exe):")
+	fmt.Println("       ./cross-file-obfuscator -binary -auto-discover-pkgs -obfuscate-third-party \\")
+	fmt.Println("           -project /path/to/my_project /path/to/app.exe")
 	fmt.Println()
-	
-	fmt.Println("  \033[36m4. 无源码二进制局部混淆\033[0m")
-	fmt.Println("  功能: 仅通过指定关键字，对无源码的二进制文件进行混淆。")
+
+	fmt.Println("  \033[36m场景 3: 只想让杀软不误报 (最小改动)\033[0m")
+	fmt.Println("  适用: 程序本身正常，只是被 Windows 杀软经常误报，想保留标准库特征。")
+	fmt.Println("  效果: 只混淆你项目自己的包，标准库保持原样，最大限度降低误报率。")
+	fmt.Println("  流程:")
+	fmt.Println("    1) 混淆源码后编译:")
+	fmt.Println("       ./cross-file-obfuscator -source -encrypt-strings ./my_project")
+	fmt.Println("       cd my_project_obfuscated && go build -trimpath -ldflags=\"-s -w\" -o app.exe")
+	fmt.Println("    2) 用 -project 指到源码，去掉可读符号但保留标准库 (可在任意目录执行):")
+	fmt.Println("       /path/to/cross-file-obfuscator -binary -auto-discover-pkgs -only-project \\")
+	fmt.Println("           -project ./my_project /path/to/app.exe")
+	fmt.Println()
+
+	fmt.Println("  \033[36m场景 4: 手上只有二进制、没有源码\033[0m")
+	fmt.Println("  适用: 拿到别人编译好的二进制，没有源码可指，只想打乱其中一部分包名做干扰。")
+	fmt.Println("  效果: 只用关键词精确命中要混淆的包 (如包名含 mycompany 或 api 的)，")
+	fmt.Println("        其余符号保持不动，出错了也不影响整体。")
 	fmt.Println("  命令:")
 	fmt.Println("    ./cross-file-obfuscator -binary -auto-discover-pkgs -pkg-filter \"mycompany,api\" app.exe")
 	fmt.Println()
@@ -126,6 +154,7 @@ func main() {
 		encryptStrings     = flag.Bool("encrypt-strings", false, "加密字符串字面量并运行时解密")
 		injectJunkCode     = flag.Bool("inject-junk", false, "注入垃圾代码以混淆分析")
 		removeComments     = flag.Bool("remove-comments", true, "移除所有注释")
+		obfuscatePositions = flag.Bool("obfuscate-positions", false, "用 //line 伪文件名混淆源码位置信息")
 		preserveReflection = flag.Bool("preserve-reflection", true, "保留反射中使用的类型/方法")
 		skipGeneratedCode  = flag.Bool("skip-generated", true, "跳过自动生成的代码文件")
 		excludePatterns    = flag.String("exclude", "", "要排除的文件模式 (逗号分隔)")
@@ -143,12 +172,18 @@ func main() {
 		packageFilter        = flag.String("pkg-filter", "", "包名过滤关键字")
 		obfuscatePaths       = flag.Bool("obfuscate-paths", true, "混淆二进制中残留的 .go 源文件绝对路径")
 		showHelp             = flag.Bool("h", false, "显示帮助信息")
+		logLevel             = flag.String("log-level", "info", "日志级别 (debug/info/warn/error)")
 	)
 
 	// 自定义 Usage 函数
 	flag.Usage = printUsage
 
 	flag.Parse()
+
+	// 设置日志级别
+	if lvl, ok := logger.ParseLevel(*logLevel); ok {
+		logger.SetLevel(lvl)
+	}
 
 	// 如果用户使用 -h 参数，显示帮助并退出
 	if *showHelp || flag.NArg() < 1 || (!*sourceMode && !*binaryMode) {
@@ -157,7 +192,7 @@ func main() {
 	}
 
 	if *sourceMode && *binaryMode {
-		log.Fatal("错误: 不能同时启用 -source 和 -binary 模式，请选择其一")
+		logger.Fatalf("错误: 不能同时启用 -source 和 -binary 模式，请选择其一")
 	}
 
 	target := flag.Arg(0)
@@ -167,10 +202,10 @@ func main() {
 		// 验证项目目录
 		info, err := os.Stat(target)
 		if err != nil {
-			log.Fatalf("错误: 无法访问项目根目录 %s: %v", target, err)
+			logger.Fatalf("错误: 无法访问项目根目录 %s: %v", target, err)
 		}
 		if !info.IsDir() {
-			log.Fatalf("错误: 源码混淆的项目根路径必须是一个目录: %s", target)
+			logger.Fatalf("错误: 源码混淆的项目根路径必须是一个目录: %s", target)
 		}
 
 		// 设置输出目录
@@ -181,11 +216,11 @@ func main() {
 		// 检查输出目录是否已存在（仅在非干跑模式下）
 		if !*dryRun {
 			if err := checkAndHandleExistingDir(*outputDir); err != nil {
-				log.Fatalf("错误: %v", err)
+				logger.Fatalf("错误: %v", err)
 			}
 
 			if err := os.MkdirAll(*outputDir, 0755); err != nil {
-				log.Fatalf("错误: 无法创建输出目录 %s: %v", *outputDir, err)
+				logger.Fatalf("错误: 无法创建输出目录 %s: %v", *outputDir, err)
 			}
 		}
 
@@ -205,6 +240,7 @@ func main() {
 			EncryptStrings:     *encryptStrings,
 			InjectJunkCode:     *injectJunkCode,
 			RemoveComments:     *removeComments,
+			ObfuscatePositions: *obfuscatePositions,
 			PreserveReflection: *preserveReflection,
 			SkipGeneratedCode:  *skipGeneratedCode,
 			ExcludePatterns:    excludePatternsList,
@@ -218,17 +254,22 @@ func main() {
 		printConfiguration(target, *outputDir, config, excludePatternsList)
 
 		// 执行混淆
-		fmt.Println("开始源码混淆...")
+		logger.Infof("开始源码混淆...")
 		if err := obf.Run(); err != nil {
-			log.Fatalf("错误: %v", err)
+			logger.Fatalf("错误: %v", err)
+		}
+
+		// 干跑模式：报告已由 Run 打印完毕，不再输出统计与完成信息
+		if *dryRun {
+			return
 		}
 
 		// 打印统计信息
 		stats := obf.GetStatistics()
 		printStatistics(stats)
 
-		fmt.Println("\n[OK] 源码混淆完成!")
-		fmt.Printf("输出目录: %s\n", *outputDir)
+		logger.Infof("源码混淆完成")
+		logger.Infof("输出目录: %s", *outputDir)
 		return
 	}
 
@@ -237,10 +278,10 @@ func main() {
 		// 验证二进制文件
 		info, err := os.Stat(target)
 		if err != nil {
-			log.Fatalf("错误: 无法访问二进制文件 %s: %v", target, err)
+			logger.Fatalf("错误: 无法访问二进制文件 %s: %v", target, err)
 		}
 		if info.IsDir() {
-			log.Fatalf("错误: 二进制修改的目标必须是一个文件，而非目录: %s", target)
+			logger.Fatalf("错误: 二进制修改的目标必须是一个文件，而非目录: %s", target)
 		}
 
 		// 解析包名替换映射
@@ -273,7 +314,7 @@ func main() {
 
 		// 验证无源码模式下的自动发现 (交由 linker.go 内部基于是否存在 go.mod 进行最终验证)
 		if *autoDiscoverPkgs && *projectRoot == "" && *packageFilter == "" {
-			log.Fatal("错误: 在没有指定源码目录 (-project) 的情况下使用自动发现，如果当前目录无 go.mod，必须提供 -pkg-filter 关键字")
+			logger.Fatalf("错误: 在没有指定源码目录 (-project) 的情况下使用自动发现，如果当前目录无 go.mod，必须提供 -pkg-filter 关键字")
 		}
 
 		// 执行混淆
@@ -281,10 +322,10 @@ func main() {
 
 		// 执行混淆
 		if err := linkerObf.ObfuscateExistingBinary(target); err != nil {
-			log.Fatalf("二进制混淆失败: %v", err)
+			logger.Fatalf("二进制混淆失败: %v", err)
 		}
 
-		fmt.Printf("\n[OK] 二进制修改成功! 文件: %s\n", target)
+		logger.Infof("二进制修改成功! 文件: %s", target)
 		return
 	}
 }
@@ -307,6 +348,7 @@ func printConfiguration(projectRoot, outputDir string, config *obfuscator.Config
 	fmt.Printf("  加密字符串:       %v\n", config.EncryptStrings)
 	fmt.Printf("  注入垃圾代码:     %v\n", config.InjectJunkCode)
 	fmt.Printf("  移除注释:         %v\n", config.RemoveComments)
+	fmt.Printf("  混淆位置:         %v\n", config.ObfuscatePositions)
 	fmt.Printf("  保留反射:         %v\n", config.PreserveReflection)
 	fmt.Printf("  跳过生成代码:     %v\n", config.SkipGeneratedCode)
 	if config.DryRun {
@@ -323,9 +365,14 @@ func printStatistics(stats *obfuscator.Statistics) {
 	fmt.Println("========================================")
 	fmt.Println("   混淆统计")
 	fmt.Println("========================================")
+	fmt.Printf("总 Go 文件:   %d\n", stats.TotalFiles)
+	fmt.Printf("已混淆文件:   %d\n", stats.ObfuscatedFiles)
 	fmt.Printf("受保护名称: %d\n", stats.ProtectedNames)
 	fmt.Printf("混淆函数:   %d\n", stats.FunctionsObf)
 	fmt.Printf("混淆变量:   %d\n", stats.VariablesObf)
+	if stats.StringsEncrypt > 0 {
+		fmt.Printf("加密字符串: %d\n", stats.StringsEncrypt)
+	}
 	if stats.SkippedFiles > 0 {
 		fmt.Printf("跳过文件:   %d\n", stats.SkippedFiles)
 	}
