@@ -733,6 +733,15 @@ func (o *Obfuscator) obfuscateOutputFiles(fileMapping map[string]string) error {
 
 // obfuscateFileWithMapping 使用文件映射混淆单个文件
 func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[string]string) error {
+	// 兜底：解密包文件禁止二次混淆，防止 ensureDecryptPackageImport 让解密包导入自己
+	// 造成 import cycle，也防止垃圾注入对解密函数注入递归 panic(decrypt(...))。
+	if o.Config.EncryptStrings && o.decryptPkgName != "" {
+		relPath, _ := filepath.Rel(o.outputDir, filePath)
+		if o.isInsideDecryptPkg(relPath) {
+			return nil
+		}
+	}
+
 	// 解析文件
 	node, err := parser.ParseFile(o.fset, filePath, nil, parser.ParseComments)
 	if err != nil {
