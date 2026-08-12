@@ -44,6 +44,12 @@ type LinkerObfuscator struct {
 	config     *LinkConfig
 	projectDir string
 	outputBin  string
+
+	// buildInfoEnd 记录 Go buildinfo 段在文件中的结束偏移（0 表示未知）。
+	// 由 processMachO/processELF 解析段表时填入，用于限制 obfuscateBuildInfo
+	// 的扫描范围，避免越界改写 __go_buildinfo 段之后的其他 __DATA 数据
+	// （如 __itablink、运行时元数据），否则程序启动时会崩溃。
+	buildInfoEnd int
 }
 
 // NewLinkerObfuscator 创建新的链接器混淆器
@@ -124,6 +130,13 @@ func (lo *LinkerObfuscator) postProcessBinary() error {
 			logger.Infof("[OK] 混淆了 %d 个源代码文件路径", pathCount)
 			modified = true
 		}
+	}
+
+	// 混淆 Go buildinfo 段中残留的依赖版本/hash/构建环境信息
+	biCount := lo.obfuscateBuildInfo(newData)
+	if biCount > 0 {
+		logger.Infof("[OK] 混淆了 %d 个 BuildInfo 元数据项", biCount)
+		modified = true
 	}
 
 	if modified {
@@ -218,6 +231,77 @@ func (lo *LinkerObfuscator) obfuscateFilePaths(data []byte) int {
 	return count
 }
 
+// obfuscateBuildInfo 混淆二进制中残留的 Go buildinfo 段（__go_buildinfo）。
+// Go 工具链会把构建时所有依赖模块的路径/版本/content hash（h1:...）以及
+// 构建环境（GOOS/GOARCH/编译器/GODEBUG 等）原样写入该段。其中 h1: 模块 hash
+// 是依赖源码的内容指纹，攻击者可据此精确反推整棵依赖树。这里把所有可读的
+// metadata 替换为等长的随机可读串，保留段布局以便程序正常启动。
+func (lo *LinkerObfuscator) obfuscateBuildInfo(data []byte) int {
+	// Go buildinfo 的魔数签名：\xff Go buildinf: <magic>
+	sig := []byte{'G', 'o', ' ', 'b', 'u', 'i', 'l', 'd', 'i', 'n', 'f', ':'}
+	idx := -1
+	for i := 0; i <= len(data)-len(sig); i++ {
+		if data[i] == 0xff && i+14 <= len(data) && bytes.Equal(data[i+2:i+14], sig) {
+			idx = i + 2
+			break
+		}
+	}
+	if idx < 0 {
+		return 0
+	}
+
+	// buildinfo 段一般很小（几 KB），从签名后开始扫描可读串
+	// 保留签名本身与结构分隔符（\t \x00 等），只替换内容。
+	// 若解析段表时已确认 __go_buildinfo/.go.buildinfo 段的边界，
+	// 严格限制在该段内扫描，防止越界改写后续 __DATA 数据导致程序崩溃。
+	const maxScan = 64 * 1024
+	end := idx + maxScan
+	if end > len(data) {
+		end = len(data)
+	}
+	if lo.buildInfoEnd > idx && end > lo.buildInfoEnd {
+		end = lo.buildInfoEnd
+	}
+
+	nameGen := NewNaturalNameGenerator()
+	count := 0
+	// 从签名之后开始扫描，保留 "Go buildinf:" 魔数本身（后续的 \x08 magic 与
+	// 版本串 go1.x 等才属于待混淆的元数据）。
+	j := idx + len(sig)
+	for j < end {
+		c := data[j]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			// 找到一段连续可读串
+			start := j
+			for j < end {
+				c := data[j]
+				// 可读字符集刻意排除 ':' 与 '='：':' 是 h1: 哈希前缀的分隔符，
+				// '=' 是 key=value 结构及 base64 padding 的分隔符。若把它们一并
+				// 替换会破坏 buildinfo 结构，导致 debug.ReadBuildInfo 解析失败。
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '/' || c == '_' || c == '-' || c == '+' || c == '@' {
+					j++
+				} else {
+					break
+				}
+			}
+			strLen := j - start
+			// 阈值取 6：最短的语义化版本号 vX.Y.Z 恰好 6 字符（如 v1.1.0），
+			// 而 buildinfo 的结构标签最长仅 5 字符（build），必须保留以便
+			// debug.ReadBuildInfo 正常解析。用 6 既能覆盖所有依赖版本号，
+			// 又不会误改结构标签。
+			if strLen >= 6 {
+				repl := nameGen.GeneratePackageName(string(data[start:j]), strLen)
+				copy(data[start:j], repl)
+				count++
+			}
+			continue
+		}
+		j++
+	}
+
+	return count
+}
+
 // isLikelyGoFilePath 判断一个被 .go 正则匹配到的字符串是否为真正的源代码文件路径，
 // 防止误篡改嵌入的数据区（yaml/json）导致运行时解析失败。
 func isLikelyGoFilePath(path string) bool {
@@ -283,6 +367,10 @@ func (lo *LinkerObfuscator) processELF(data []byte) ([]byte, bool, error) {
 				})
 			}
 		}
+		// 记录 .go.buildinfo 段边界，供 obfuscateBuildInfo 限定扫描范围
+		if section.Name == ".go.buildinfo" {
+			lo.buildInfoEnd = int(section.Offset + section.Size)
+		}
 	}
 	return lo.processPclntabBinary(data, candidates)
 }
@@ -326,6 +414,10 @@ func (lo *LinkerObfuscator) processMachO(data []byte) ([]byte, bool, error) {
 					name: section.Name, data: sectionData, fileOffset: uint64(section.Offset),
 				})
 			}
+		}
+		// 记录 __go_buildinfo 段边界，供 obfuscateBuildInfo 限定扫描范围
+		if section.Name == "__go_buildinfo" {
+			lo.buildInfoEnd = int(uint64(section.Offset) + uint64(section.Size))
 		}
 	}
 	return lo.processPclntabBinary(data, candidates)
@@ -516,6 +608,31 @@ func (lo *LinkerObfuscator) obfuscateFunctionNames(data []byte, pclntabOffset in
 		}
 	}
 
+	// 按 pattern 长度降序排序，确保更长（更具体）的子包路径优先替换。
+	// 原因：模块根路径（如 github.com/x/y/）与子包路径（如 github.com/x/y/sub/）
+	// 同时存在时，若短的模块前缀先被替换，子包长 pattern 将无法再匹配，
+	// 导致 pclntab 中残留可读的子包段名（如 /lib、/types、/antlr 等）。
+	{
+		type pr struct {
+			pat string
+			rep string
+		}
+		prs := make([]pr, 0, len(patterns))
+		for i := range patterns {
+			prs = append(prs, pr{patterns[i], replacements[i]})
+		}
+		sort.SliceStable(prs, func(i, j int) bool {
+			if len(prs[i].pat) != len(prs[j].pat) {
+				return len(prs[i].pat) > len(prs[j].pat)
+			}
+			return prs[i].pat < prs[j].pat
+		})
+		for i := range prs {
+			patterns[i] = prs[i].pat
+			replacements[i] = prs[i].rep
+		}
+	}
+
 	count := 0
 	replacedPatterns := make(map[string]int)
 
@@ -599,8 +716,27 @@ func (lo *LinkerObfuscator) replaceProjectPackagePathsGlobal(data []byte) int {
 	count := 0
 	replacedPaths := make(map[string]int)
 
-	// 对每个包路径进行替换
+	// 按路径长度降序排序，确保更长（更具体）的子包路径先替换，
+	// 避免模块根路径先替换后，子包路径在二进制中无法再匹配而残留可读子段名。
+	type or struct {
+		orig string
+		repl string
+	}
+	entries := make([]or, 0, len(lo.config.PackageReplacements))
 	for original, replacement := range lo.config.PackageReplacements {
+		entries = append(entries, or{orig: original, repl: replacement})
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if len(entries[i].orig) != len(entries[j].orig) {
+			return len(entries[i].orig) > len(entries[j].orig)
+		}
+		return entries[i].orig < entries[j].orig
+	})
+
+	// 对每个包路径进行替换
+	for _, e := range entries {
+		original := e.orig
+		replacement := e.repl
 		// 移除尾部的 "." 如果有的话
 		originalPath := strings.TrimSuffix(original, ".")
 
@@ -676,16 +812,18 @@ func (lo *LinkerObfuscator) isSafePackagePathReplacement(data []byte, pos int, l
 	// 检查后面的字符
 	if pos+length < len(data) {
 		nextChar := data[pos+length]
-		// 放宽检查：只拒绝明确是标识符一部分的字符
-		// 拒绝的字符：字母、数字、下划线（说明是某个标识符的一部分）
-		// 连字符不拒绝，因为包路径后面可能跟版本号
+		// 拒绝明确是标识符一部分的字符：字母、数字、下划线、连字符。
+		// 连字符原本被允许，但会导致 github.com/foo 误匹配 github.com/foo-bar
+		// 这类同前缀不同包（后缀段以 - 开头时实为另一个包）。
+		// 包路径后合法的分隔符是 /、.、@、空格、\t、NUL、引号等，不含 -。
 		if (nextChar >= 'a' && nextChar <= 'z') ||
 			(nextChar >= 'A' && nextChar <= 'Z') ||
 			(nextChar >= '0' && nextChar <= '9') ||
-			nextChar == '_' {
+			nextChar == '_' ||
+			nextChar == '-' {
 			return false
 		}
-		// 其他字符都允许（包括 /、.、-、空格、null、引号等）
+		// 其他字符都允许（包括 /、.、空格、null、引号等）
 	}
 
 	return true
@@ -1024,34 +1162,18 @@ func (lo *LinkerObfuscator) isSafeFunctionNamePrefix(data []byte, pos int, patte
 
 		// 允许的前置字符：
 		// - 空字节 (0x00)
-		// - 不可打印字符 (< 0x20，除了空格)
-		// - 路径分隔符 (/)
+		// - 不可打印控制字符 (< 0x20)
 		//
-		// 不允许的前置字符：
-		// - 字母、数字（说明是某个标识符的一部分）
-		// - 点号（说明是包路径的一部分，如 commons.io.）
-		// - 其他可打印字符（说明可能是文本内容）
-
+		// 除此之外的任何可打印字符（字母、数字、点号、斜杠、空格、引号、
+		// 括号、下划线、连字符等）都说明这不是符号边界，而是某个文本/标识符
+		// 的一部分，替换会误伤数据区，因此一律拒绝。
 		if prevChar == 0 {
-			// 空字节，安全
 			return true
 		}
-
-		if prevChar < 0x20 && prevChar != ' ' {
-			// 不可打印字符（除了空格），安全
+		if prevChar < 0x20 {
 			return true
 		}
-
-		// 如果是字母、数字、点号、斜杠、下划线、连字符，不安全
-		if (prevChar >= 'a' && prevChar <= 'z') ||
-			(prevChar >= 'A' && prevChar <= 'Z') ||
-			(prevChar >= '0' && prevChar <= '9') ||
-			prevChar == '.' ||
-			prevChar == '/' ||
-			prevChar == '_' ||
-			prevChar == '-' {
-			return false
-		}
+		return false
 	}
 
 	// 检查后一个字符（在点号之后）
@@ -1169,11 +1291,46 @@ func (lo *LinkerObfuscator) discoverThirdPartyPackages(moduleName string) ([]str
 		}
 	}
 
+	// 从二进制的 pclntab 符号中枚举第三方模块根下的实际子包路径。
+	// go.mod 的 require 只列模块根，但被引用的子包（如
+	// google.golang.org/protobuf/types/descriptorpb、go.uber.org/zap/zapcore、
+	// golang.org/x/crypto/md4）并不在 require 中。若子包路径不在替换映射里，
+	// 其最后一段（types/descriptorpb/zapcore/md4）混淆后仍明文残留在 pclntab。
+	if lo.outputBin != "" {
+		if subs := lo.discoverThirdPartySubPackages(packages); len(subs) > 0 {
+			logger.Infof("从二进制枚举到 %d 个第三方子包路径，合并进替换映射", len(subs))
+			for _, sp := range subs {
+				packages[sp] = true
+			}
+		}
+	}
+
 	// 转换为切片并排序
 	result := make([]string, 0, len(packages))
 	for pkg := range packages {
 		result = append(result, pkg)
 	}
+
+	// 为含 "." 的路径追加 %2e 编码变体：Go 编译器会把 import 路径中
+	// 子包/包名段的 "." 编码为 %2e 写入 pclntab（如 go.uuid -> go%2euuid、
+	// yaml.v2 -> yaml%2ev2），但顶级域名段（如 github.com 的第一段）保持点号。
+	// 普通点号形态的替换 pattern 匹配不到 %2e 形态，导致符号混淆后仍明文残留。
+	extra := make([]string, 0)
+	for _, pkg := range result {
+		if !strings.ContainsAny(pkg, ".") {
+			continue
+		}
+		// 仅编码第一段 "/" 之后的 "."，保留顶级域名段
+		slash := strings.Index(pkg, "/")
+		if slash < 0 {
+			continue
+		}
+		head, tail := pkg[:slash+1], pkg[slash+1:]
+		if strings.Contains(tail, ".") {
+			extra = append(extra, head+strings.ReplaceAll(tail, ".", "%2e"))
+		}
+	}
+	result = append(result, extra...)
 
 	// 按长度降序排序（确保子包在前，避免替换冲突）
 	sort.Slice(result, func(i, j int) bool {
@@ -1181,6 +1338,97 @@ func (lo *LinkerObfuscator) discoverThirdPartyPackages(moduleName string) ([]str
 	})
 
 	return result, nil
+}
+
+// discoverThirdPartySubPackages 从二进制的 pclntab 符号中枚举第三方模块根下的实际子包路径。
+// pclntab 中每个符号是 "<完整包路径>.<函数名>" 形式，符号之间以 \x00 分隔。
+// go.mod 的 require 只列模块根，但被引用的子包（如 google.golang.org/protobuf/types/descriptorpb、
+// go.uber.org/zap/zapcore、golang.org/x/crypto/md4）并不在 require 中。若子包路径不在替换
+// 映射里，其最后一段（types/descriptorpb/zapcore/md4）混淆后仍明文残留在 pclntab。
+// 这里对每个以已知模块根开头的符号提取完整包路径（含各级子段），全部返回给调用方合并。
+func (lo *LinkerObfuscator) discoverThirdPartySubPackages(roots map[string]bool) []string {
+	data, err := os.ReadFile(lo.outputBin)
+	if err != nil {
+		return nil
+	}
+
+	rootList := make([]string, 0, len(roots))
+	for r := range roots {
+		if strings.Contains(r, "/") {
+			rootList = append(rootList, r)
+		}
+	}
+	if len(rootList) == 0 {
+		return nil
+	}
+	// 长根路径优先，确保符号能匹配到最具体的模块根
+	sort.Slice(rootList, func(i, j int) bool { return len(rootList[i]) > len(rootList[j]) })
+
+	found := make(map[string]bool)
+
+	// 以 NUL 为界切分符号串，逐个检查是否以某个模块根开头
+	tokenStart := 0
+	for i := 0; i <= len(data); i++ {
+		if i == len(data) || data[i] == 0 {
+			if i > tokenStart {
+				token := string(data[tokenStart:i])
+				pkg := matchThirdPartyRoot(token, rootList)
+				if pkg == "" {
+					tokenStart = i + 1
+					continue
+				}
+				// 拆出各级 "/" 子段前缀（如 types、types/descriptorpb），
+				// 连同完整包路径一起加入，覆盖不同深度的符号引用。
+				for idx := 0; idx < len(pkg); idx++ {
+					if pkg[idx] == '/' {
+						found[pkg[:idx]] = true
+					}
+				}
+				found[pkg] = true
+			}
+			tokenStart = i + 1
+		}
+	}
+
+	if len(found) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(found))
+	for p := range found {
+		result = append(result, p)
+	}
+	return result
+}
+
+// matchThirdPartyRoot 若符号 token 以某个模块根开头，提取其完整包路径（含子段），
+// 否则返回空字符串。包路径是 token 中最后一个 "/" 之后第一个 "." 之前的部分。
+// root 匹配要求紧接的字符必须是 "/"、"." 或 token 结束，避免
+// github.com/fatih/color 误匹配 github.com/fatih/colorable 这类同前缀不同包。
+func matchThirdPartyRoot(token string, rootList []string) string {
+	for _, root := range rootList {
+		if len(token) <= len(root) || !strings.HasPrefix(token, root) {
+			continue
+		}
+		// root 必须落在路径段边界上
+		next := token[len(root)]
+		if next != '/' && next != '.' {
+			continue
+		}
+		lastSlash := strings.LastIndexByte(token, '/')
+		end := len(token)
+		if lastSlash >= 0 {
+			if dot := strings.IndexByte(token[lastSlash+1:], '.'); dot >= 0 {
+				end = lastSlash + 1 + dot
+			}
+		}
+		pkg := token[:end]
+		if len(pkg) <= len(root) {
+			// 符号包路径就是模块根本身（如 <root>.init），不是子包
+			continue
+		}
+		return pkg
+	}
+	return ""
 }
 
 // addCommonSubPackages 添加常见的子包路径（如 internal, pkg, cmd 等）
