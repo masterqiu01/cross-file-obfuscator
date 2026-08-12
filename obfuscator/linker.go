@@ -174,6 +174,13 @@ func (lo *LinkerObfuscator) obfuscateFilePaths(data []byte) int {
 			continue
 		}
 
+		// 过滤伪路径：URL（https://...//host/path）等会被正则误匹配为
+		// "//xxx.go" 的伪 .go 路径。它们本身不是源代码文件路径，且可能落在
+		// 嵌入的 yaml/json 等数据区，篡改后会导致程序运行时解析失败。
+		if !isLikelyGoFilePath(path) {
+			continue
+		}
+
 		// 使用不可见的高位 ASCII 字符替换，彻底避开 strings 提取
 		// 这样既保持了等长，又使字符串失去了可打印特性
 		rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(start)))
@@ -209,6 +216,25 @@ func (lo *LinkerObfuscator) obfuscateFilePaths(data []byte) int {
 	}
 
 	return count
+}
+
+// isLikelyGoFilePath 判断一个被 .go 正则匹配到的字符串是否为真正的源代码文件路径，
+// 防止误篡改嵌入的数据区（yaml/json）导致运行时解析失败。
+func isLikelyGoFilePath(path string) bool {
+	// 含 "//" 的多半是 URL（scheme://host），而真实源文件路径不会出现双斜杠
+	if strings.Contains(path, "//") {
+		return false
+	}
+	// 以 scheme: 开头的也不是文件路径（如 http:、https:、file:）
+	if idx := strings.Index(path, ":"); idx >= 0 {
+		// Windows 盘符如 C:\ 开头的允许（如 C:\src\main.go），其余拒绝
+		if idx == 1 && len(path) > 2 && path[1] == ':' &&
+			((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 // detectBinaryFormat 检测二进制文件格式
