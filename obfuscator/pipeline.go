@@ -23,6 +23,9 @@ func (o *Obfuscator) Run() error {
 		logger.Warnf("无法读取 go.mod (将使用文件夹名启发式判断): %v", err)
 	}
 
+	// 识别含独立 go.mod 的嵌套子模块，为各模块根独立分发解密包
+	o.discoverSubModuleRoots()
+
 	// 如果启用了字符串加密，创建解密包并保护相关名称（干跑模式下不创建任何文件）
 	if o.Config.EncryptStrings {
 		// 提前保护解密函数名称和包名
@@ -372,12 +375,21 @@ func (o *Obfuscator) collectProtectedNames(node *ast.File, filePath string) {
 }
 
 // isProjectImportPath 检查导入路径是否属于项目内部
+// （根模块 + 所有嵌套子模块的导入路径均视为项目内部）
 func (o *Obfuscator) isProjectImportPath(importPath string) bool {
 
 	// 优先使用 go.mod 中的模块名进行精确匹配（最可靠）
 	if o.moduleName != "" {
-		return importPath == o.moduleName ||
-			strings.HasPrefix(importPath, o.moduleName+"/")
+		if importPath == o.moduleName || strings.HasPrefix(importPath, o.moduleName+"/") {
+			return true
+		}
+		// 嵌套子模块的导入路径同样属于项目内部
+		for _, subModuleName := range o.subModuleRoots {
+			if importPath == subModuleName || strings.HasPrefix(importPath, subModuleName+"/") {
+				return true
+			}
+		}
+		return false
 	}
 
 	// 回退：文件夹名启发式判断（go.mod 不存在时）
@@ -401,6 +413,98 @@ func (o *Obfuscator) readModuleName() error {
 	o.moduleName = name
 	logger.Infof("读取模块名成功: %s", o.moduleName)
 	return nil
+}
+
+// discoverSubModuleRoots 扫描项目内所有含独立 go.mod 的嵌套子模块目录，
+// 记录 相对路径 -> 模块名，用于向各子模块根分发解密包，保证子模块独立可编译。
+func (o *Obfuscator) discoverSubModuleRoots() {
+	o.subModuleRoots = make(map[string]string)
+	err := filepath.Walk(o.projectRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || path == o.projectRoot {
+			return nil
+		}
+		if info.Name() == "vendor" || info.Name() == ".git" || info.Name() == "node_modules" {
+			return filepath.SkipDir
+		}
+		goMod := filepath.Join(path, "go.mod")
+		if _, statErr := os.Stat(goMod); statErr != nil {
+			return nil
+		}
+		modName, modErr := readModuleNameFromFile(goMod)
+		if modErr != nil {
+			return nil
+		}
+		if strings.HasPrefix(modName, o.moduleName+"/") {
+			logger.Infof("跳过子模块 %s (模块名 %s 与根模块冲突, 视为根模块一部分)", path, modName)
+			return nil
+		}
+		rel, _ := filepath.Rel(o.projectRoot, path)
+		o.subModuleRoots[filepath.ToSlash(rel)] = modName
+		logger.Infof("发现嵌套子模块: %s (模块名: %s)", rel, modName)
+		return nil
+	})
+	if err != nil {
+		logger.Warnf("扫描嵌套子模块失败: %v", err)
+	}
+}
+
+// moduleNameForFile 返回文件路径所属模块的模块名。
+// 优先匹配最近嵌套子模块根，否则返回根模块名。
+// absPath 可为项目根或输出目录下的路径（两者目录结构一致）。
+func (o *Obfuscator) moduleNameForFile(absPath string) string {
+	if len(o.subModuleRoots) == 0 {
+		return o.moduleName
+	}
+	rel, err := filepath.Rel(o.projectRoot, absPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		rel, err = filepath.Rel(o.outputDir, absPath)
+		if err != nil {
+			return o.moduleName
+		}
+	}
+	fileDir := filepath.ToSlash(filepath.Dir(rel))
+	bestRel := ""
+	for subRel := range o.subModuleRoots {
+		if (subRel == fileDir || strings.HasPrefix(fileDir, subRel+"/")) && len(subRel) > len(bestRel) {
+			bestRel = subRel
+		}
+	}
+	if bestRel == "" {
+		return o.moduleName
+	}
+	return o.subModuleRoots[bestRel]
+}
+
+// decryptPkgImportPathForFile 返回文件所属模块内解密包的导入路径。
+// 不同模块使用各自模块名拼接，保证独立编译时能被解析。
+func (o *Obfuscator) decryptPkgImportPathForFile(absPath string) string {
+	return o.moduleNameForFile(absPath) + "/" + o.decryptPkgName
+}
+
+// isInsideDecryptPkg 判断相对路径是否位于任意一个实际创建的解密包目录内
+// （基于 dropDirs 精确匹配，避免随机包名与用户目录同名时误跳过）
+func (o *Obfuscator) isInsideDecryptPkg(relPath string) bool {
+	relPath = filepath.ToSlash(relPath)
+	dir := filepath.ToSlash(filepath.Dir(relPath))
+	if o.decryptPkgDirs[dir] {
+		return true
+	}
+	// 逐层向上：解密包目录下的深层子目录（理论上解密包内部仅单层文件）也应覆盖
+	cur := dir
+	for {
+		if o.decryptPkgDirs[cur] {
+			return true
+		}
+		parent := filepath.ToSlash(filepath.Dir(cur))
+		if parent == "." || parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return false
 }
 
 // buildObfuscationMapsWithScope 使用作用域分析构建混淆映射
@@ -599,10 +703,10 @@ func (o *Obfuscator) obfuscateOutputFiles(fileMapping map[string]string) error {
 			return nil
 		}
 
-		// 跳过解密包自身
+		// 跳过解密包自身（精确匹配主模块根与各嵌套子模块根的实际解密包目录）
 		if o.Config.EncryptStrings && o.decryptPkgName != "" {
 			relPath, _ := filepath.Rel(o.outputDir, path)
-			if relPath == o.decryptPkgName || strings.HasPrefix(relPath, o.decryptPkgName+string(filepath.Separator)) {
+			if o.isInsideDecryptPkg(relPath) {
 				return nil
 			}
 		}
@@ -666,7 +770,8 @@ func (o *Obfuscator) obfuscateFileWithMapping(filePath string, fileMapping map[s
 	// （连续等号对齐不受影响；注释、导入路径、结构体标签、const 值不会被触碰）
 	if o.Config.EncryptStrings {
 		var encryptedCount int
-		source, encryptedCount = o.encryptStringsInSource(source)
+		decryptImportPath := o.decryptPkgImportPathForFile(filePath)
+		source, encryptedCount = o.encryptStringsInSource(source, decryptImportPath)
 		o.encryptedStringCount += encryptedCount
 	}
 
@@ -1044,12 +1149,12 @@ func (o *Obfuscator) removeCommentsFromAST(node *ast.File) {
 	node.Comments = kept
 }
 
-// ensureDecryptPackageImport 确保源代码中导入了解密包
-func (o *Obfuscator) ensureDecryptPackageImport(source string) string {
-	importLine := fmt.Sprintf(`%s "%s"`, o.decryptPkgName, o.decryptPkgPath)
+// ensureDecryptPackageImport 确保源代码中导入了指定路径的解密包
+func (o *Obfuscator) ensureDecryptPackageImport(source string, decryptPkgPath string) string {
+	importLine := fmt.Sprintf(`%s "%s"`, o.decryptPkgName, decryptPkgPath)
 
 	// 检查是否已经导入
-	if strings.Contains(source, o.decryptPkgPath) {
+	if strings.Contains(source, decryptPkgPath) {
 		return source
 	}
 
@@ -1081,7 +1186,7 @@ func (o *Obfuscator) ensureDecryptPackageImport(source string) string {
 // encryptStringsInSource 在源代码中加密字符串字面量（使用解密包的函数），返回修改后的源码和加密数量。
 // 基于 AST 精确定位字符串，天然排除注释、导入路径、结构体标签与 const 常量的字符串，
 // 不会破坏注释内容，也没有逐行解析时的状态泄漏问题（如反引号跨越、注释内引号等）。
-func (o *Obfuscator) encryptStringsInSource(source string) (string, int) {
+func (o *Obfuscator) encryptStringsInSource(source string, decryptPkgPath string) (string, int) {
 	fset := token.NewFileSet()
 	node, err := parser.ParseFile(fset, "", source, parser.ParseComments)
 	if err != nil {
@@ -1190,7 +1295,7 @@ func (o *Obfuscator) encryptStringsInSource(source string) (string, int) {
 	sb.WriteString(source[last:])
 
 	newSource := sb.String()
-	newSource = o.ensureDecryptPackageImport(newSource)
+	newSource = o.ensureDecryptPackageImport(newSource, decryptPkgPath)
 	// 重新格式化，修复文本级导入注入导致的缩进问题
 	if formatted, err := format.Source([]byte(newSource)); err == nil {
 		newSource = string(formatted)
@@ -1204,10 +1309,11 @@ func (o *Obfuscator) createDecryptPackage() error {
 		return nil
 	}
 
-	// 设置解密包路径（在输出目录下，而不是原始项目目录）
-	decryptPkgDir := filepath.Join(o.outputDir, o.decryptPkgName)
-	if err := os.MkdirAll(decryptPkgDir, 0755); err != nil {
-		return fmt.Errorf("创建解密包目录失败: %v", err)
+	// 设置解密包路径（在输出目录下，而不是原始项目目录）：
+	// 主模块根 + 每个含独立 go.mod 的嵌套子模块根各放一份，保证子模块可独立编译。
+	pkgRelDirs := []string{""}
+	for subRel := range o.subModuleRoots {
+		pkgRelDirs = append(pkgRelDirs, subRel)
 	}
 
 	// 生成解密包的内容（每种策略对应一个独立函数）
@@ -1278,11 +1384,20 @@ import "encoding/base64"
 
 %s`, o.decryptPkgName, funcs.String())
 
-	// 写入文件（使用随机文件名）
+	// 写入文件（使用随机文件名，各模块根使用同一文件名）
 	randomFileName := generateRandomString(10) + ".go"
-	decryptFilePath := filepath.Join(decryptPkgDir, randomFileName)
-	if err := os.WriteFile(decryptFilePath, []byte(decryptFileContent), 0644); err != nil {
-		return fmt.Errorf("写入解密文件失败: %v", err)
+	o.decryptPkgDirs = make(map[string]bool, len(pkgRelDirs))
+	for _, pkgRelDir := range pkgRelDirs {
+		decryptPkgDir := filepath.Join(o.outputDir, pkgRelDir, o.decryptPkgName)
+		if err := os.MkdirAll(decryptPkgDir, 0755); err != nil {
+			return fmt.Errorf("创建解密包目录失败: %v", err)
+		}
+		decryptFilePath := filepath.Join(decryptPkgDir, randomFileName)
+		if err := os.WriteFile(decryptFilePath, []byte(decryptFileContent), 0644); err != nil {
+			return fmt.Errorf("写入解密文件失败: %v", err)
+		}
+		relDir, _ := filepath.Rel(o.outputDir, decryptPkgDir)
+		o.decryptPkgDirs[filepath.ToSlash(relDir)] = true
 	}
 
 	// 读取 go.mod 获取模块名（从原始项目目录读取）
@@ -1302,6 +1417,6 @@ import "encoding/base64"
 	}
 	o.packageNames[o.decryptPkgName] = true
 
-	logger.Infof("创建解密包: %s (导入路径: %s, 函数名: %s)", decryptPkgDir, o.decryptPkgPath, o.decryptFuncName)
+	logger.Infof("创建解密包: %d 处 (导入路径: %s, 函数名: %s)", len(pkgRelDirs), o.decryptPkgPath, o.decryptFuncName)
 	return nil
 }

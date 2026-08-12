@@ -53,6 +53,13 @@ type Obfuscator struct {
 	// go.mod 解析缓存
 	moduleName string
 
+	// 嵌套模块识别：项目内含独立 go.mod 的目录（相对路径） -> 其模块名。
+	// 用于按模块向各模块根分发解密包，确保每个子模块能独立编译。
+	subModuleRoots map[string]string
+
+	// 解密包实际创建的目录（相对输出目录），用于精确跳过而非路径段猜测
+	decryptPkgDirs map[string]bool
+
 	// 统计信息
 	totalGoFiles         int
 	obfuscatedGoFiles    int
