@@ -1160,14 +1160,25 @@ func (o *Obfuscator) ensureDecryptPackageImport(source string, decryptPkgPath st
 
 	lines := strings.Split(source, "\n")
 	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "import (") {
-			// 在 import 块中添加
-			lines[i] = line + "\n\t" + importLine
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "import (") {
+			// 多行 import 块
+			rest := strings.TrimSuffix(strings.TrimPrefix(trimmed, "import ("), ")")
+			rest = strings.TrimSpace(rest)
+			if rest != "" {
+				// 单行块形式 import ("fmt")：展开为多行，避免新导入落在闭合括号外
+				lines[i] = "import (\n\t" + importLine + "\n\t" + rest + "\n)"
+			} else {
+				// 常规多行块：在 "import (" 后追加
+				lines[i] = line + "\n\t" + importLine
+			}
 			return strings.Join(lines, "\n")
 		}
-		if strings.HasPrefix(strings.TrimSpace(line), "import ") {
-			// 单行 import，转换为块
-			lines[i] = "import (\n\t" + importLine + "\n" + strings.TrimPrefix(line, "import ") + "\n)"
+		if strings.HasPrefix(trimmed, "import ") {
+			// 单行 import（可能带缩进），转换为块；用 trimmed 提取路径，
+			// 避免原 line 带前导空白时 TrimPrefix 失效生成嵌套非法 import。
+			path := strings.TrimSpace(strings.TrimPrefix(trimmed, "import "))
+			lines[i] = "import (\n\t" + importLine + "\n\t" + path + "\n)"
 			return strings.Join(lines, "\n")
 		}
 	}
