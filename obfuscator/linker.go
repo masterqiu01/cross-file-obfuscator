@@ -355,21 +355,35 @@ func (lo *LinkerObfuscator) obfuscateBuildInfoCopies(data []byte, skipStart, ski
 		if j >= skipStart && j < skipEnd {
 			continue
 		}
-		// 从 'v' 本身开始（j+1），保证 vX.Y.Z 整体满足 >= 6 阈值；
-		// 仅当 v 后紧跟数字才视为版本号，避免误伤 \tvalue/\tvariable 等普通文本
+		// 从 'v' 本身开始（j+1），保证 vX.Y.Z 整体满足 >= 6 阈值。
+		// 版本号必须同时满足：
+		//   1. v 后紧跟数字（避免误伤 \tvalue/\tvariable 等普通文本）
+		//   2. 扫描区间内必须包含 '.'（真实 semver v1.2.3 / pseudo-version 必有，
+		//      而代码段指令巧合形成的 \t v <数字> 后不跟 '.'，如 09 76 36 48...）
+		//   3. 区间内只允许版本号字符（字母数字 . - +），防止代码段长串被误判
 		start := j + 1
 		if start+1 >= len(data) || data[start+1] < '0' || data[start+1] > '9' {
 			continue
 		}
 		e := start
+		hasDot := false
 		for e < len(data) {
 			c := data[e]
 			if c == '\t' || c == '\n' || c == 0 {
 				break
 			}
-			e++
+			// 版本号只允许字母数字与 . - +；遇到其他字符（代码指令等）终止
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' {
+				if c == '.' {
+					hasDot = true
+				}
+				e++
+			} else {
+				break
+			}
 		}
-		if e-start >= 6 {
+		if e-start >= 6 && hasDot {
 			repl := nameGen.GeneratePackageName(string(data[start:e]), e-start)
 			copy(data[start:e], repl)
 			count++
