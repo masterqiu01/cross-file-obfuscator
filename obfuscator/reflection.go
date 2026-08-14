@@ -40,16 +40,16 @@ var jsonEntryFns = map[string]bool{
 
 // detectReflectionUsage 检查文件是否使用反射
 func (o *Obfuscator) detectReflectionUsage(node *ast.File) bool {
-	return hasImportPath(node, "reflect", o.moduleName)
+	return hasImportPath(node, "reflect")
 }
 
 // detectJSONUsage 检查文件是否使用 JSON 编码/解码
 func (o *Obfuscator) detectJSONUsage(node *ast.File) bool {
-	return hasImportPathContains(node, []string{"encoding/json", "encoding/xml", "gopkg.in/yaml"}, o.moduleName)
+	return hasImportPathContains(node, []string{"encoding/json", "encoding/xml", "gopkg.in/yaml"})
 }
 
 // hasImportPath 判断文件是否导入指定的单一路径。
-func hasImportPath(node *ast.File, target, moduleName string) bool {
+func hasImportPath(node *ast.File, target string) bool {
 	for _, imp := range node.Imports {
 		if imp.Path == nil {
 			continue
@@ -59,12 +59,11 @@ func hasImportPath(node *ast.File, target, moduleName string) bool {
 			return true
 		}
 	}
-	_ = moduleName
 	return false
 }
 
 // hasImportPathContains 判断文件是否导入了包含任一关键字的路径。
-func hasImportPathContains(node *ast.File, targets []string, moduleName string) bool {
+func hasImportPathContains(node *ast.File, targets []string) bool {
 	for _, imp := range node.Imports {
 		if imp.Path == nil {
 			continue
@@ -76,7 +75,6 @@ func hasImportPathContains(node *ast.File, targets []string, moduleName string) 
 			}
 		}
 	}
-	_ = moduleName
 	return false
 }
 
@@ -119,8 +117,8 @@ func (o *Obfuscator) collectReflectionUsage(node *ast.File, analyzer *ScopeAnaly
 		}
 
 		// 支持两类调用形式：
-		//   1. reflect.TypeOf(x)             → Fun 为 SelectorExpr
-		//   2. reflect.TypeFor[User]()       → Fun 为 IndexExpr { SelectorExpr, 类型参数 }
+		//   1. reflect.TypeOf(x)             -> Fun 为 SelectorExpr
+		//   2. reflect.TypeFor[User]()       -> Fun 为 IndexExpr { SelectorExpr, 类型参数 }
 		fn := ce.Fun
 		var typeArgs []ast.Expr
 		if idx, ok := fn.(*ast.IndexExpr); ok {
@@ -271,7 +269,7 @@ func (o *Obfuscator) collectTypeNamesFromExpr(expr ast.Expr, analyzer *ScopeAnal
 		return false
 
 	case *ast.SelectorExpr:
-		// pkg.Type → 若为项目包则记录 Sel（跨文件按名保护）
+		// pkg.Type -> 若为项目包则记录 Sel（跨文件按名保护）
 		if pkgIdent, ok := e.X.(*ast.Ident); ok {
 			if pkgPath, isImport := importPaths[pkgIdent.Name]; isImport {
 				if o.isProjectImportPathResolved(pkgPath) && o.collectTypeNamesFromTypeExpr(e, out) {
@@ -279,7 +277,7 @@ func (o *Obfuscator) collectTypeNamesFromExpr(expr ast.Expr, analyzer *ScopeAnal
 				}
 			}
 		}
-		// 若 X 是本作用域变量/参数（字段访问 x.Field → 无法静态得知所属
+		// 若 X 是本作用域变量/参数（字段访问 x.Field -> 无法静态得知所属
 		// 结构体类型），保守回退；包级引用已在上面处理。
 		return false
 
@@ -293,7 +291,7 @@ func (o *Obfuscator) collectTypeNamesFromExpr(expr ast.Expr, analyzer *ScopeAnal
 		}
 
 		// 嵌套反射调用：reflect.New(reflect.TypeOf(User{})) / reflect.ValueOf(...).Call(...)
-		// 等，参数本身又是一个反射入口点 → 深入其数据参数。
+		// 等，参数本身又是一个反射入口点 -> 深入其数据参数。
 		if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
 			if pkgIdent, isPkg := sel.X.(*ast.Ident); isPkg {
 				if pkgPath, isImport := importPaths[pkgIdent.Name]; isImport && pkgPath == "reflect" && reflectEntryFns[sel.Sel.Name] {
@@ -305,11 +303,11 @@ func (o *Obfuscator) collectTypeNamesFromExpr(expr ast.Expr, analyzer *ScopeAnal
 			}
 		}
 
-		// 转换表达式 T(x)：Fun 是类型表达式（非包函数调用）→ 记录类型
+		// 转换表达式 T(x)：Fun 是类型表达式（非包函数调用）-> 记录类型
 		if o.collectTypeNamesFromTypeExpr(e.Fun, out) {
 			return true
 		}
-		// 一般函数调用 → 无法静态解析返回类型
+		// 一般函数调用 -> 无法静态解析返回类型
 		return false
 
 	case *ast.IndexExpr:
@@ -355,16 +353,6 @@ func isLikelyTypeIdent(name string) bool {
 		return false
 	}
 	return name != ""
-}
-
-// isNameAType 判断标识符是不是类型名（通过已有 scope 类型对象判断）。
-func (o *Obfuscator) isNameAType(name string) bool {
-	for _, sa := range o.fileScopes {
-		if obj, ok := sa.GetFileScope().Objects[name]; ok && obj.Kind == ObjType {
-			return true
-		}
-	}
-	return false
 }
 
 // collectNamesFromIdentDecl 解析标识符（变量/常量/参数/接收者）的声明，
@@ -470,16 +458,18 @@ func (o *Obfuscator) protectReflectionTypes() {
 			continue
 		}
 		if st, ok := ts.Type.(*ast.StructType); ok {
-			collectStructFieldTypes(st, worklist, done)
+			worklist = append(worklist, collectStructFieldTypes(st, done)...)
 		}
 	}
 }
 
-// collectStructFieldTypes 遍历结构体字段，把字段指向的命名类型加入待展开队列。
-func collectStructFieldTypes(st *ast.StructType, worklist []string, done map[string]bool) {
+// collectStructFieldTypes 遍历结构体字段，返回字段指向的命名类型列表，
+// 由调用方加入待展开队列（slice 值传递无法原地追加，改为返回值）。
+func collectStructFieldTypes(st *ast.StructType, done map[string]bool) []string {
 	if st.Fields == nil {
-		return
+		return nil
 	}
+	var worklist []string
 	for _, field := range st.Fields.List {
 		var names []string
 		ast.Inspect(field.Type, func(n ast.Node) bool {
@@ -499,6 +489,7 @@ func collectStructFieldTypes(st *ast.StructType, worklist []string, done map[str
 			}
 		}
 	}
+	return worklist
 }
 
 // findTypeSpecByName 在已扫描文件中查找指定名字的 TypeSpec（跨文件）。

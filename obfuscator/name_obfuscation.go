@@ -2,6 +2,50 @@ package obfuscator
 
 import "strings"
 
+// protectedIdentifiers 常见 Go 内置标识符（类型/函数/常量），
+// 混淆后会导致编译错误，必须始终保护。包级定义避免在热路径反复分配。
+var protectedIdentifiers = map[string]bool{
+	"error":      true, // 内置错误接口
+	"string":     true, // 内置类型
+	"int":        true,
+	"bool":       true,
+	"byte":       true,
+	"rune":       true,
+	"float32":    true,
+	"float64":    true,
+	"complex64":  true,
+	"complex128": true,
+	"uint":       true,
+	"int8":       true,
+	"int16":      true,
+	"int32":      true,
+	"int64":      true,
+	"uint8":      true,
+	"uint16":     true,
+	"uint32":     true,
+	"uint64":     true,
+	"uintptr":    true,
+	"len":        true, // 内置函数
+	"cap":        true,
+	"make":       true,
+	"new":        true,
+	"append":     true,
+	"copy":       true,
+	"delete":     true,
+	"panic":      true,
+	"recover":    true,
+	"print":      true,
+	"println":    true,
+	"close":      true,
+	"min":        true, // Go 1.21+ 内置函数
+	"max":        true,
+	"clear":      true,
+	"nil":        true, // 内置常量
+	"true":       true,
+	"false":      true,
+	"iota":       true,
+}
+
 // shouldProtect 检查名称是否应受保护而不被混淆
 func (o *Obfuscator) shouldProtect(name string) bool {
 	// 保护特殊名称
@@ -21,47 +65,6 @@ func (o *Obfuscator) shouldProtect(name string) bool {
 		return true
 	}
 	// 保护可能导致问题的常见 Go 标识符
-	protectedIdentifiers := map[string]bool{
-		"error":      true, // 内置错误接口
-		"string":     true, // 内置类型
-		"int":        true,
-		"bool":       true,
-		"byte":       true,
-		"rune":       true,
-		"float32":    true,
-		"float64":    true,
-		"complex64":  true,
-		"complex128": true,
-		"uint":       true,
-		"int8":       true,
-		"int16":      true,
-		"int32":      true,
-		"int64":      true,
-		"uint8":      true,
-		"uint16":     true,
-		"uint32":     true,
-		"uint64":     true,
-		"uintptr":    true,
-		"len":        true, // 内置函数
-		"cap":        true,
-		"make":       true,
-		"new":        true,
-		"append":     true,
-		"copy":       true,
-		"delete":     true,
-		"panic":      true,
-		"recover":    true,
-		"print":      true,
-		"println":    true,
-		"close":      true,
-		"min":        true, // Go 1.21+ 内置函数
-		"max":        true,
-		"clear":      true,
-		"nil":        true, // 内置常量
-		"true":       true,
-		"false":      true,
-		"iota":       true,
-	}
 	return protectedIdentifiers[name]
 }
 

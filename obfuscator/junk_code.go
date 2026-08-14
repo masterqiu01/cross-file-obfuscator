@@ -81,11 +81,6 @@ const (
 	anchorString
 )
 
-// generateJunkStatements 生成更加多样化和随机的垃圾代码语句
-func (o *Obfuscator) generateJunkStatements(used map[string]bool) []ast.Stmt {
-	return o.generateJunkStatementsWithAnchors(used, nil)
-}
-
 // generateJunkStatementsWithAnchors 生成垃圾代码；anchors 提供运行时锚点，
 // 有锚点时优先注入锚点谓词（不可折叠），其余为常规结构垃圾块。
 func (o *Obfuscator) generateJunkStatementsWithAnchors(used map[string]bool, anchors []junkAnchor) []ast.Stmt {
@@ -115,7 +110,6 @@ func (o *Obfuscator) generateJunkStatementsWithAnchors(used map[string]bool, anc
 	})
 
 	for i := 0; i < count; i++ {
-		generators[i] = generators[i%len(generators)]
 		if anchors != nil && MascotRandInt(3) == 0 {
 			// 有可用锚点时，用锚点谓词替换其中一个常规垃圾块，
 			// 保证至少一部分垃圾代码依赖运行时值而无法被常量折叠。

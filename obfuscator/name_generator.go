@@ -37,7 +37,7 @@ func NewNaturalNameGenerator() *NaturalNameGenerator {
 }
 
 // GeneratePackageName 生成指定长度的看起来自然的包名
-// 例如: "runtime." (8 chars) → "libcore." (8 chars)
+// 例如: "runtime." (8 chars) -> "libcore." (8 chars)
 func (g *NaturalNameGenerator) GeneratePackageName(originalName string, targetLength int) string {
 	hasDot := strings.HasSuffix(originalName, ".")
 
@@ -61,8 +61,13 @@ func (g *NaturalNameGenerator) GeneratePackageName(originalName string, targetLe
 		attempt++
 	}
 
-	// 如果实在找不到，返回随机字符（但保持可读性）
-	return g.generateRandomReadable(originalName, targetLength, hasDot)
+	// 如果实在找不到，返回随机字符（但保持可读性），并写回 usedNames 保证唯一
+	name := g.generateRandomReadable(originalName, targetLength, hasDot)
+	for g.usedNames[name] {
+		name = g.generateRandomReadable(originalName, targetLength, hasDot)
+	}
+	g.usedNames[name] = true
+	return name
 }
 
 // generateName 生成指定长度的名称

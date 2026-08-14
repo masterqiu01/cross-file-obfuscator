@@ -32,7 +32,6 @@ type Obfuscator struct {
 	Config *Config
 
 	// 字符串加密追踪
-	decryptFuncName   string
 	decryptFuncNames  []string
 	decryptPkgName    string
 	decryptPkgPath    string
@@ -48,7 +47,7 @@ type Obfuscator struct {
 
 	// 反射精确保护（garble 式：只保护实际被反射/JSON 引用的类型，
 	// 而非『import reflect 即保护整文件』；无法静态解析时回退整文件保护）
-	reflectionTargetTypes map[string]bool // 类型名 → 该类型确实被 reflect/JSON 引用
+	reflectionTargetTypes map[string]bool // 类型名 -> 该类型确实被 reflect/JSON 引用
 
 	// go.mod 解析缓存
 	moduleName string

@@ -21,8 +21,6 @@ func New(projectRoot, outputDir string, config *Config) *Obfuscator {
 	}
 
 	encryptionKey := generateRandomString(64)
-	// 生成完全随机的导出函数名（首字母大写）
-	decryptFuncName := fmt.Sprintf("%c%s", 'A'+rng.IntN(26), generateRandomString(11))
 	decryptPkgName := fmt.Sprintf("p%s", generateRandomString(8))
 
 	// 为每种字符串解密策略生成独立的随机函数名
@@ -44,7 +42,6 @@ func New(projectRoot, outputDir string, config *Config) *Obfuscator {
 		protectedNames:        make(map[string]bool),
 		packageNames:          make(map[string]bool),
 		Config:                config,
-		decryptFuncName:       decryptFuncName,
 		decryptFuncNames:      decryptFuncNames,
 		decryptPkgName:        decryptPkgName,
 		fileScopes:            make(map[string]*ScopeAnalyzer),

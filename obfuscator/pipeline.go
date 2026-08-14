@@ -29,7 +29,6 @@ func (o *Obfuscator) Run() error {
 	// 如果启用了字符串加密，创建解密包并保护相关名称（干跑模式下不创建任何文件）
 	if o.Config.EncryptStrings {
 		// 提前保护解密函数名称和包名
-		o.protectedNames[o.decryptFuncName] = true
 		for _, name := range o.decryptFuncNames {
 			o.protectedNames[name] = true
 		}
@@ -212,7 +211,7 @@ func (o *Obfuscator) printDryRunReport() error {
 		if obj.Kind == ObjFunc {
 			funcCount++
 			if printed < 20 {
-				fmt.Printf("    函数: %-30s  →  %s\n", obj.Name, obfName)
+				fmt.Printf("    函数: %-30s  ->  %s\n", obj.Name, obfName)
 				printed++
 			}
 		} else if obj.Kind == ObjVar || obj.Kind == ObjConst {
@@ -581,7 +580,7 @@ func (o *Obfuscator) buildObfuscationMapsWithScope() {
 
 		// 如果有多个同名对象，打印日志
 		if len(objects) > 1 {
-			logger.Debugf("同名对象使用相同混淆名: %s → %s (在 %d 个文件中定义)", name, obfName, len(objects))
+			logger.Debugf("同名对象使用相同混淆名: %s -> %s (在 %d 个文件中定义)", name, obfName, len(objects))
 		}
 	}
 
@@ -1431,12 +1430,11 @@ import "encoding/base64"
 	o.decryptPkgCreated = true
 
 	// 保护解密函数名称和包名，防止被混淆
-	o.protectedNames[o.decryptFuncName] = true
 	for _, name := range o.decryptFuncNames {
 		o.protectedNames[name] = true
 	}
 	o.packageNames[o.decryptPkgName] = true
 
-	logger.Infof("创建解密包: %d 处 (导入路径: %s, 函数名: %s)", len(pkgRelDirs), o.decryptPkgPath, o.decryptFuncName)
+	logger.Infof("创建解密包: %d 处 (导入路径: %s, 函数名: %v)", len(pkgRelDirs), o.decryptPkgPath, o.decryptFuncNames)
 	return nil
 }

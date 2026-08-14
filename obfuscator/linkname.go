@@ -89,7 +89,7 @@ func (o *Obfuscator) mapLinknameTarget(target string) string {
 
 	// 目标必须属于本项目（moduleName 前缀）
 	module := o.moduleName
-	if module == "" || pkgPath != module && !strings.HasPrefix(pkgPath, module+"/") {
+	if module == "" || (pkgPath != module && !strings.HasPrefix(pkgPath, module+"/")) {
 		return target
 	}
 

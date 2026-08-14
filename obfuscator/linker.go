@@ -7,7 +7,6 @@ import (
 	"debug/pe"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,19 +14,11 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"time"
 
 	"cross-file-obfuscator/internal/logger"
 )
 
 // Go pclntab magic values
-const (
-	go12magic  = 0xfffffffb
-	go116magic = 0xfffffffa
-	go118magic = 0xfffffff0
-	go120magic = 0xfffffff1
-)
-
 // standardLibraryNames 标准库包名集合（函数名前缀可安全替换）
 var standardLibraryNames = map[string]bool{
 	"main": true, "runtime": true, "sync": true, "fmt": true,
@@ -75,19 +66,26 @@ func NewLinkerObfuscator(projectDir, outputBin string, config *LinkConfig) *Link
 func (lo *LinkerObfuscator) ObfuscateExistingBinary(binPath string) error {
 	logger.Infof("=== 链接器级别混淆 (直接对二进制进行修改) ===")
 
+	lo.outputBin = binPath
+
+	// 读一次二进制数据，供发现阶段与混淆阶段复用，避免大文件被重复读入内存
+	// （发现阶段枚举第三方子包、无源码模式发现包名各会再次读文件）。
+	binData, err := os.ReadFile(binPath)
+	if err != nil {
+		return fmt.Errorf("无法读取二进制文件: %v", err)
+	}
+
 	// 如果启用了自动包名发现且没有手动指定包名替换
 	if lo.config.AutoDiscoverPackages && len(lo.config.PackageReplacements) == 0 {
 		logger.Infof("第 0 步: 自动发现项目包名...")
-		if err := lo.discoverAndGeneratePackageReplacements(); err != nil {
+		if err := lo.discoverAndGeneratePackageReplacements(binData); err != nil {
 			logger.Warnf("自动发现包名失败: %v", err)
 			logger.Warnf("将继续使用默认包名替换模式")
 		}
 	}
 
-	lo.outputBin = binPath
-
 	logger.Infof("第 1 步: 开始修改二进制文件...")
-	if err := lo.postProcessBinary(); err != nil {
+	if err := lo.postProcessBinary(binData); err != nil {
 		return fmt.Errorf("混淆失败: %v", err)
 	}
 	logger.Infof("[OK] 混淆完成")
@@ -95,29 +93,32 @@ func (lo *LinkerObfuscator) ObfuscateExistingBinary(binPath string) error {
 	return nil
 }
 
-// postProcessBinary 后处理二进制文件
-func (lo *LinkerObfuscator) postProcessBinary() error {
-	data, err := os.ReadFile(lo.outputBin)
-	if err != nil {
-		return err
-	}
-
+// postProcessBinary 后处理二进制文件（data 已由调用方读入，原地修改）
+func (lo *LinkerObfuscator) postProcessBinary(data []byte) error {
 	// 检测二进制格式
 	format := detectBinaryFormat(data)
 	logger.Debugf("检测到二进制格式: %s", format)
 
+	if format != "ELF" && format != "PE" && format != "Mach-O" {
+		return fmt.Errorf("不支持的二进制格式: %s", format)
+	}
+
+	// 原地修改前先备份原始数据（避免额外复制一份全文件到 newData）
+	backupPath := lo.outputBin + ".backup"
+	if err := os.WriteFile(backupPath, data, 0755); err != nil {
+		return fmt.Errorf("备份失败: %v", err)
+	}
+
 	var modified bool
-	var newData []byte
+	var err error
 
 	switch format {
 	case "ELF":
-		newData, modified, err = lo.processELF(data)
+		modified, err = lo.processELF(data)
 	case "PE":
-		newData, modified, err = lo.processPE(data)
+		modified, err = lo.processPE(data)
 	case "Mach-O":
-		newData, modified, err = lo.processMachO(data)
-	default:
-		return fmt.Errorf("不支持的二进制格式: %s", format)
+		modified, err = lo.processMachO(data)
 	}
 
 	if err != nil {
@@ -125,7 +126,7 @@ func (lo *LinkerObfuscator) postProcessBinary() error {
 	}
 
 	if lo.config.ObfuscateFilePaths {
-		pathCount := lo.obfuscateFilePaths(newData)
+		pathCount := lo.obfuscateFilePaths(data)
 		if pathCount > 0 {
 			logger.Infof("[OK] 混淆了 %d 个源代码文件路径", pathCount)
 			modified = true
@@ -133,21 +134,15 @@ func (lo *LinkerObfuscator) postProcessBinary() error {
 	}
 
 	// 混淆 Go buildinfo 段中残留的依赖版本/hash/构建环境信息
-	biCount := lo.obfuscateBuildInfo(newData)
+	biCount := lo.obfuscateBuildInfo(data)
 	if biCount > 0 {
 		logger.Infof("[OK] 混淆了 %d 个 BuildInfo 元数据项", biCount)
 		modified = true
 	}
 
 	if modified {
-		// 备份原文件
-		backupPath := lo.outputBin + ".backup"
-		if err := os.WriteFile(backupPath, data, 0755); err != nil {
-			return fmt.Errorf("备份失败: %v", err)
-		}
-
 		// 写入修改后的文件
-		if err := os.WriteFile(lo.outputBin, newData, 0755); err != nil {
+		if err := os.WriteFile(lo.outputBin, data, 0755); err != nil {
 			return fmt.Errorf("写入失败: %v", err)
 		}
 
@@ -165,6 +160,8 @@ func (lo *LinkerObfuscator) postProcessBinary() error {
 			}
 		}
 	} else {
+		// 未发生任何修改：outputBin 未被改动，备份与其内容相同。
+		// 不删除备份，避免误删用户已有的 .backup 文件（虽然本次写入会覆盖它）。
 		logger.Warnf("未找到 pclntab 或无需修改")
 	}
 
@@ -196,13 +193,11 @@ func (lo *LinkerObfuscator) obfuscateFilePaths(data []byte) int {
 
 		// 使用不可见的高位 ASCII 字符替换，彻底避开 strings 提取
 		// 这样既保持了等长，又使字符串失去了可打印特性
-		rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(start)))
-
 		for j := start; j < end-3; j++ {
 			c := data[j]
 			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
 				// 替换为 0x80 到 0xFE 之间的高位不可见/乱码字节
-				data[j] = byte(rng.Intn(127) + 128)
+				data[j] = byte(rng.IntN(127) + 128)
 			}
 		}
 		count++
@@ -217,12 +212,10 @@ func (lo *LinkerObfuscator) obfuscateFilePaths(data []byte) int {
 		end := match[1]
 
 		// 同样使用高位不可见字符，等长替换整个 go.shape 字符串
-		rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(start)))
-
 		for j := start; j < end; j++ {
 			c := data[j]
 			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-				data[j] = byte(rng.Intn(127) + 128)
+				data[j] = byte(rng.IntN(127) + 128)
 			}
 		}
 		count++
@@ -299,6 +292,131 @@ func (lo *LinkerObfuscator) obfuscateBuildInfo(data []byte) int {
 		j++
 	}
 
+	// 额外处理：Go 链接器会把 buildinfo 字符串额外复制到 __TEXT,__rodata
+	// （作为 runtime 引用的字符串常量）。这份副本不含 "Go buildinf:" 签名，
+	// 上面的段内扫描（受 buildInfoEnd 限定）无法覆盖，导致其中的 h1 依赖
+	// content hash 与版本号仍以明文残留。这里全局扫描这两类特征补齐。
+	count += lo.obfuscateBuildInfoCopies(data, idx, end)
+
+	return count
+}
+
+// obfuscateBuildInfoCopies 全局混淆 buildinfo 段之外的副本（如 __TEXT,__rodata）。
+// 只处理两类特征：\th1: 后的 base64 content hash、\tvX.Y.Z 依赖版本号。
+// skipStart/skipEnd 为 __go_buildinfo 段已处理范围，避免重复替换。
+func (lo *LinkerObfuscator) obfuscateBuildInfoCopies(data []byte, skipStart, skipEnd int) int {
+	nameGen := NewNaturalNameGenerator()
+	count := 0
+
+	// 1. 扫描 "\th1:" 特征，替换其后的 base64 content hash（保留 h1: 前缀与 = padding）
+	h1 := []byte("h1:")
+	for pos := 0; pos <= len(data)-len(h1); {
+		i := bytes.Index(data[pos:], h1)
+		if i < 0 {
+			break
+		}
+		j := pos + i
+		pos = j + len(h1)
+
+		if j >= skipStart && j < skipEnd {
+			continue
+		}
+		// 前置必须是 \t（buildinfo 中 h1 紧跟制表符），降低误伤普通数据
+		if j == 0 || data[j-1] != '\t' {
+			continue
+		}
+		start := j + len(h1)
+		e := start
+		for e < len(data) {
+			c := data[e]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '/' {
+				e++
+			} else {
+				break
+			}
+		}
+		if e-start >= 6 {
+			repl := nameGen.GeneratePackageName(string(data[start:e]), e-start)
+			copy(data[start:e], repl)
+			count++
+		}
+	}
+
+	// 2. 扫描 "\tv<digit>" 特征，替换依赖版本号（semver 或 pseudo-version）
+	tabV := []byte{'\t', 'v'}
+	for pos := 0; pos <= len(data)-len(tabV); {
+		i := bytes.Index(data[pos:], tabV)
+		if i < 0 {
+			break
+		}
+		j := pos + i
+		pos = j + len(tabV)
+
+		if j >= skipStart && j < skipEnd {
+			continue
+		}
+		// 从 'v' 本身开始（j+1），保证 vX.Y.Z 整体满足 >= 6 阈值；
+		// 仅当 v 后紧跟数字才视为版本号，避免误伤 \tvalue/\tvariable 等普通文本
+		start := j + 1
+		if start+1 >= len(data) || data[start+1] < '0' || data[start+1] > '9' {
+			continue
+		}
+		e := start
+		for e < len(data) {
+			c := data[e]
+			if c == '\t' || c == '\n' || c == 0 {
+				break
+			}
+			e++
+		}
+		if e-start >= 6 {
+			repl := nameGen.GeneratePackageName(string(data[start:e]), e-start)
+			copy(data[start:e], repl)
+			count++
+		}
+	}
+
+	// 3. 处理 rodata 副本中 dep/mod/path 条目里残留的无域名模块名。
+	//    含 "/" 的模块名已被 replaceProjectPackagePathsGlobal 全局替换，
+	//    但无域名模块名（如 grpc-c）不含 "/"，仍以明文残留，此处补齐。
+	for _, tag := range [][]byte{[]byte("dep\t"), []byte("mod\t"), []byte("path\t")} {
+		for pos := 0; pos <= len(data)-len(tag); {
+			i := bytes.Index(data[pos:], tag)
+			if i < 0 {
+				break
+			}
+			j := pos + i
+			pos = j + len(tag)
+
+			if j >= skipStart && j < skipEnd {
+				continue
+			}
+			// tag 前一个字符必须是分隔符（非标识符字符），避免误伤 "remod\t" 等
+			if j > 0 {
+				prev := data[j-1]
+				if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+					(prev >= '0' && prev <= '9') || prev == '.' || prev == '-' || prev == '_' {
+					continue
+				}
+			}
+			start := j + len(tag)
+			e := start
+			for e < len(data) {
+				c := data[e]
+				if c == '\t' || c == '\n' || c == 0 {
+					break
+				}
+				e++
+			}
+			strLen := e - start
+			if strLen >= 6 && !bytes.Contains(data[start:e], []byte("/")) {
+				repl := nameGen.GeneratePackageName(string(data[start:e]), strLen)
+				copy(data[start:e], repl)
+				count++
+			}
+		}
+	}
+
 	return count
 }
 
@@ -349,11 +467,11 @@ func detectBinaryFormat(data []byte) string {
 	return "Unknown"
 }
 
-// processELF 处理 ELF 格式的二进制文件
-func (lo *LinkerObfuscator) processELF(data []byte) ([]byte, bool, error) {
+// processELF 处理 ELF 格式的二进制文件（原地修改）
+func (lo *LinkerObfuscator) processELF(data []byte) (bool, error) {
 	elfFile, err := elf.NewFile(bytes.NewReader(data))
 	if err != nil {
-		return data, false, fmt.Errorf("解析 ELF 失败: %v", err)
+		return false, fmt.Errorf("解析 ELF 失败: %v", err)
 	}
 	defer elfFile.Close()
 
@@ -361,9 +479,12 @@ func (lo *LinkerObfuscator) processELF(data []byte) ([]byte, bool, error) {
 	var candidates []pclntabSegment
 	for _, section := range elfFile.Sections {
 		if section.Name == ".gopclntab" || section.Name == ".data.rel.ro" {
-			if sectionData, err := section.Data(); err == nil {
+			// 直接引用原文件数据的切片，避免 section.Data() 复制大段数据
+			off := int(section.Offset)
+			size := int(section.Size)
+			if off >= 0 && size > 0 && off+size <= len(data) {
 				candidates = append(candidates, pclntabSegment{
-					name: section.Name, data: sectionData, fileOffset: uint64(section.Offset),
+					name: section.Name, data: data[off : off+size], fileOffset: uint64(section.Offset),
 				})
 			}
 		}
@@ -375,11 +496,11 @@ func (lo *LinkerObfuscator) processELF(data []byte) ([]byte, bool, error) {
 	return lo.processPclntabBinary(data, candidates)
 }
 
-// processPE 处理 PE 格式的二进制文件
-func (lo *LinkerObfuscator) processPE(data []byte) ([]byte, bool, error) {
+// processPE 处理 PE 格式的二进制文件（原地修改）
+func (lo *LinkerObfuscator) processPE(data []byte) (bool, error) {
 	peFile, err := pe.NewFile(bytes.NewReader(data))
 	if err != nil {
-		return data, false, fmt.Errorf("解析 PE 失败: %v", err)
+		return false, fmt.Errorf("解析 PE 失败: %v", err)
 	}
 	defer peFile.Close()
 
@@ -387,9 +508,12 @@ func (lo *LinkerObfuscator) processPE(data []byte) ([]byte, bool, error) {
 	var candidates []pclntabSegment
 	for _, section := range peFile.Sections {
 		if section.Name == ".rdata" || section.Name == ".data" {
-			if sectionData, err := section.Data(); err == nil {
+			// 直接引用原文件数据的切片，避免 section.Data() 复制大段数据
+			off := int(section.Offset)
+			size := int(section.Size)
+			if off >= 0 && size > 0 && off+size <= len(data) {
 				candidates = append(candidates, pclntabSegment{
-					name: section.Name, data: sectionData, fileOffset: uint64(section.Offset),
+					name: section.Name, data: data[off : off+size], fileOffset: uint64(section.Offset),
 				})
 			}
 		}
@@ -397,11 +521,11 @@ func (lo *LinkerObfuscator) processPE(data []byte) ([]byte, bool, error) {
 	return lo.processPclntabBinary(data, candidates)
 }
 
-// processMachO 处理 Mach-O 格式的二进制文件
-func (lo *LinkerObfuscator) processMachO(data []byte) ([]byte, bool, error) {
+// processMachO 处理 Mach-O 格式的二进制文件（原地修改）
+func (lo *LinkerObfuscator) processMachO(data []byte) (bool, error) {
 	machoFile, err := macho.NewFile(bytes.NewReader(data))
 	if err != nil {
-		return data, false, fmt.Errorf("解析 Mach-O 失败: %v", err)
+		return false, fmt.Errorf("解析 Mach-O 失败: %v", err)
 	}
 	defer machoFile.Close()
 
@@ -409,9 +533,12 @@ func (lo *LinkerObfuscator) processMachO(data []byte) ([]byte, bool, error) {
 	var candidates []pclntabSegment
 	for _, section := range machoFile.Sections {
 		if section.Name == "__gopclntab" || section.Name == "__data" {
-			if sectionData, err := section.Data(); err == nil {
+			// 直接引用原文件数据的切片，避免 section.Data() 复制大段数据
+			off := int(section.Offset)
+			size := int(section.Size)
+			if off >= 0 && size > 0 && off+size <= len(data) {
 				candidates = append(candidates, pclntabSegment{
-					name: section.Name, data: sectionData, fileOffset: uint64(section.Offset),
+					name: section.Name, data: data[off : off+size], fileOffset: uint64(section.Offset),
 				})
 			}
 		}
@@ -430,8 +557,8 @@ type pclntabSegment struct {
 	fileOffset uint64
 }
 
-// processPclntabBinary 在候选段中搜索 pclntab magic，找不到再全文件搜索，然后修改数据
-func (lo *LinkerObfuscator) processPclntabBinary(data []byte, candidates []pclntabSegment) ([]byte, bool, error) {
+// processPclntabBinary 在候选段中搜索 pclntab magic，找不到再全文件搜索，然后原地修改数据
+func (lo *LinkerObfuscator) processPclntabBinary(data []byte, candidates []pclntabSegment) (bool, error) {
 	var pclntabOffset int64 = -1
 
 	for _, seg := range candidates {
@@ -447,7 +574,7 @@ func (lo *LinkerObfuscator) processPclntabBinary(data []byte, candidates []pclnt
 		// 在整个文件中搜索
 		offset := findPclntabMagic(data)
 		if offset < 0 {
-			return data, false, nil
+			return false, nil
 		}
 		pclntabOffset = int64(offset)
 		logger.Debugf("找到 pclntab 在文件偏移: 0x%x", pclntabOffset)
@@ -456,52 +583,54 @@ func (lo *LinkerObfuscator) processPclntabBinary(data []byte, candidates []pclnt
 	return lo.modifyPclntab(data, pclntabOffset)
 }
 
-// findPclntabMagic 在数据中查找 pclntab magic value
+// findPclntabMagic 在数据中查找 pclntab magic value（用 bytes.Index 快速定位，
+// 避免对超大文件逐字节扫描）。
 func findPclntabMagic(data []byte) int {
-	magics := []uint32{go12magic, go116magic, go118magic, go120magic}
+	// 各 magic 值的小端字节序列
+	magics := [][]byte{
+		{0xfb, 0xff, 0xff, 0xff}, // go12magic
+		{0xfa, 0xff, 0xff, 0xff}, // go116magic
+		{0xf0, 0xff, 0xff, 0xff}, // go118magic
+		{0xf1, 0xff, 0xff, 0xff}, // go120magic
+	}
 
-	for i := 0; i <= len(data)-4; i++ {
-		value := binary.LittleEndian.Uint32(data[i : i+4])
-		for _, magic := range magics {
-			if value == magic {
-				return i
+	best := -1
+	for _, m := range magics {
+		if i := bytes.Index(data, m); i >= 0 {
+			if best < 0 || i < best {
+				best = i
 			}
 		}
 	}
-
-	return -1
+	return best
 }
 
-// modifyPclntab 修改 pclntab 的内容
-func (lo *LinkerObfuscator) modifyPclntab(data []byte, offset int64) ([]byte, bool, error) {
+// modifyPclntab 原地修改 pclntab 的内容
+func (lo *LinkerObfuscator) modifyPclntab(data []byte, offset int64) (bool, error) {
 	if offset < 0 || offset+4 > int64(len(data)) {
-		return data, false, fmt.Errorf("无效的 pclntab 偏移")
+		return false, fmt.Errorf("无效的 pclntab 偏移")
 	}
 
-	// 复制数据以避免修改原始数据
-	newData := make([]byte, len(data))
-	copy(newData, data)
-
 	// 读取原始 magic value（仅用于显示）
-	originalMagic := binary.LittleEndian.Uint32(newData[offset : offset+4])
+	originalMagic := binary.LittleEndian.Uint32(data[offset : offset+4])
 	logger.Debugf("原始 magic value: 0x%08x", originalMagic)
 
 	// 检查是否完全禁用 pclntab 修改
 	if lo.config.DisablePclntab {
 		logger.Warnf("pclntab 修改已禁用（避免杀软误报）")
-		return data, false, nil
+		return false, nil
 	}
 
 	// 混淆函数名
 	if lo.config.RemoveFuncNames {
-		if err := lo.obfuscateFunctionNames(newData, offset); err != nil {
-			return data, false, fmt.Errorf("函数名混淆失败: %v", err)
+		if err := lo.obfuscateFunctionNames(data, offset); err != nil {
+			return false, fmt.Errorf("函数名混淆失败: %v", err)
 		}
 		logger.Infof("[OK] 已混淆函数名")
-		return newData, true, nil
+		return true, nil
 	}
 
-	return data, false, nil
+	return false, nil
 }
 
 // obfuscateFunctionNames 混淆二进制中的函数名（使用等长自然混淆）
@@ -647,44 +776,67 @@ func (lo *LinkerObfuscator) obfuscateFunctionNames(data []byte, pclntabOffset in
 		pclntabSearchEnd = len(data)
 	}
 
-	for i, pattern := range patterns {
-		if i >= len(replacements) {
-			break
+	// 用 Aho-Corasick 多模式匹配：单次扫描 pclntab 区域收集所有匹配位置，
+	// 替代逐 pattern 的 bytes.Index 扫描（每个 pattern 各扫一遍整段数据）。
+	patternBytes := make([][]byte, len(patterns))
+	for i := range patterns {
+		patternBytes[i] = []byte(patterns[i])
+	}
+	matcher := newACMatcher(patternBytes)
+
+	type funcMatch struct {
+		pos int
+		idx int
+	}
+	var matches []funcMatch
+	matcher.match(data, int(pclntabOffset), pclntabSearchEnd, func(pos, idx int) bool {
+		// 过滤跨 pclntab 起点的匹配：AC 可能报告起始位置在 pclntabOffset
+		// 之前的 pattern（其尾部落在搜索范围内），这类匹配不在 pclntab 区域，
+		// 原逐 pattern 扫描也不会命中，需排除。
+		if pos >= int(pclntabOffset) {
+			matches = append(matches, funcMatch{pos: pos, idx: idx})
+		}
+		return true
+	})
+
+	// 按位置升序、同位置按长度降序排序，保证长 pattern 优先替换；
+	// 短 pattern 与已替换的长 pattern 重叠时被跳过（与原长度降序语义一致）。
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].pos != matches[j].pos {
+			return matches[i].pos < matches[j].pos
+		}
+		return len(patternBytes[matches[i].idx]) > len(patternBytes[matches[j].idx])
+	})
+
+	lastEnd := -1
+	for _, mm := range matches {
+		pb := patternBytes[mm.idx]
+		plen := len(pb)
+		if mm.pos < lastEnd {
+			continue
+		}
+		// 更严格的上下文检查
+		if !lo.isSafeFunctionNamePrefix(data, mm.pos, pb) {
+			continue
 		}
 
-		patternBytes := []byte(pattern)
-		replacement := []byte(replacements[i])
-		patternCount := 0
-
-		// 只在 pclntab 区域内查找并替换
-		for j := int(pclntabOffset); j < pclntabSearchEnd-len(patternBytes); j++ {
-			if bytes.Equal(data[j:j+len(patternBytes)], patternBytes) {
-				// 更严格的上下文检查
-				if !lo.isSafeFunctionNamePrefix(data, j, patternBytes) {
-					continue
-				}
-
-				// ⭐ 等长替换：确保替换字符串与原字符串长度完全相同
-				if len(replacement) == len(patternBytes) {
-					// 直接替换，无需填充
-					copy(data[j:j+len(replacement)], replacement)
-					count++
-					patternCount++
-				} else if len(replacement) < len(patternBytes) {
-					// 如果替换字符串较短（不应该发生，但作为保护）
-					// 使用原始字符串填充方式而不是 0x00
-					copy(data[j:j+len(replacement)], replacement)
-					// 不填充，保持原有字符（更安全）
-					count++
-					patternCount++
-				}
-				// 忽略替换字符串过长的情况
-			}
+		replacement := []byte(replacements[mm.idx])
+		// 等长替换：确保替换字符串与原字符串长度完全相同
+		if len(replacement) == plen {
+			// 直接替换，无需填充
+			copy(data[mm.pos:mm.pos+len(replacement)], replacement)
+			count++
+			replacedPatterns[patterns[mm.idx]]++
+		} else if len(replacement) < plen {
+			// 如果替换字符串较短（不应该发生，但作为保护）
+			// 使用原始字符串填充方式而不是 0x00
+			copy(data[mm.pos:mm.pos+len(replacement)], replacement)
+			// 不填充，保持原有字符（更安全）
+			count++
+			replacedPatterns[patterns[mm.idx]]++
 		}
-
-		if patternCount > 0 {
-			replacedPatterns[pattern] = patternCount
-		}
+		// 忽略替换字符串过长的情况
+		lastEnd = mm.pos + plen
 	}
 
 	// 替换项目包路径（在整个二进制文件中替换，但有严格的安全检查）
@@ -733,50 +885,76 @@ func (lo *LinkerObfuscator) replaceProjectPackagePathsGlobal(data []byte) int {
 		return entries[i].orig < entries[j].orig
 	})
 
-	// 对每个包路径进行替换
+	// 收集所有含 "/" 的非标准库包路径，构建 AC 自动机。
+	// 过滤标准库与无 "/" 的单词路径，避免误替换系统符号。
+	type pathEntry struct {
+		origPath []byte
+		replPath []byte
+		origStr  string
+	}
+	var pathEntries []pathEntry
+	var pathPatterns [][]byte
 	for _, e := range entries {
-		original := e.orig
-		replacement := e.repl
-		// 移除尾部的 "." 如果有的话
-		originalPath := strings.TrimSuffix(original, ".")
-
-		// 跳过标准库包（标准库包名太短，可能误替换系统符号）
+		originalPath := strings.TrimSuffix(e.orig, ".")
 		if standardLibraryNames[originalPath] {
 			continue
 		}
-
-		// 只替换包含 "/" 的路径（项目包路径）
-		// 这样可以避免替换单个单词，减少误替换风险
 		if !strings.Contains(originalPath, "/") {
 			continue
 		}
+		replacementPath := strings.TrimSuffix(e.repl, ".")
+		pathEntries = append(pathEntries, pathEntry{
+			origPath: []byte(originalPath),
+			replPath: []byte(replacementPath),
+			origStr:  originalPath,
+		})
+		pathPatterns = append(pathPatterns, []byte(originalPath))
+	}
 
-		replacementPath := strings.TrimSuffix(replacement, ".")
-		patternBytes := []byte(originalPath)
-		replacementBytes := []byte(replacementPath)
+	// 用 Aho-Corasick 单次扫描全文件收集所有匹配位置，
+	// 替代逐路径的 bytes.Index 扫描。
+	matcher := newACMatcher(pathPatterns)
+	type pathMatch struct {
+		pos int
+		idx int
+	}
+	var matches []pathMatch
+	matcher.match(data, 0, len(data), func(pos, idx int) bool {
+		matches = append(matches, pathMatch{pos: pos, idx: idx})
+		return true
+	})
 
-		// 在整个二进制文件中搜索并替换，但要进行严格的安全检查
-		for j := 0; j < len(data)-len(patternBytes); j++ {
-			if bytes.Equal(data[j:j+len(patternBytes)], patternBytes) {
-				// 严格的安全检查
-				if !lo.isSafePackagePathReplacement(data, j, len(patternBytes)) {
-					continue
-				}
-
-				// 只有当替换字符串不长于原字符串时才替换
-				if len(replacementBytes) <= len(patternBytes) {
-					copy(data[j:j+len(replacementBytes)], replacementBytes)
-					// 用空字节填充剩余部分
-					for k := j + len(replacementBytes); k < j+len(patternBytes); k++ {
-						data[k] = 0
-					}
-					count++
-					replacedPaths[originalPath]++
-					// 跳过已替换的部分
-					j += len(patternBytes) - 1
-				}
-			}
+	// 按位置升序、同位置按长度降序排序，长路径优先替换，重叠的短路径跳过。
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].pos != matches[j].pos {
+			return matches[i].pos < matches[j].pos
 		}
+		return len(pathPatterns[matches[i].idx]) > len(pathPatterns[matches[j].idx])
+	})
+
+	lastEnd := -1
+	for _, mm := range matches {
+		pb := pathEntries[mm.idx].origPath
+		plen := len(pb)
+		if mm.pos < lastEnd {
+			continue
+		}
+		// 严格的安全检查
+		if !lo.isSafePackagePathReplacement(data, mm.pos, plen) {
+			continue
+		}
+		rb := pathEntries[mm.idx].replPath
+		// 只有当替换字符串不长于原字符串时才替换
+		if len(rb) <= plen {
+			copy(data[mm.pos:mm.pos+len(rb)], rb)
+			// 用空字节填充剩余部分
+			for k := mm.pos + len(rb); k < mm.pos+plen; k++ {
+				data[k] = 0
+			}
+			count++
+			replacedPaths[pathEntries[mm.idx].origStr]++
+		}
+		lastEnd = mm.pos + plen
 	}
 
 	if count > 0 {
@@ -830,7 +1008,7 @@ func (lo *LinkerObfuscator) isSafePackagePathReplacement(data []byte, pos int, l
 }
 
 // discoverAndGeneratePackageReplacements 自动发现项目包名并生成替换映射
-func (lo *LinkerObfuscator) discoverAndGeneratePackageReplacements() error {
+func (lo *LinkerObfuscator) discoverAndGeneratePackageReplacements(data []byte) error {
 	var packages []string
 	var err error
 	var moduleName string
@@ -863,15 +1041,11 @@ func (lo *LinkerObfuscator) discoverAndGeneratePackageReplacements() error {
 		}
 
 		logger.Infof("[!] 未提供源码或源码分析失败，正在从二进制文件中通过关键字 '%s' 自动发现包名...", filterKey)
-		binData, err := os.ReadFile(lo.outputBin)
-		if err != nil {
-			return fmt.Errorf("无法读取二进制文件: %v", err)
-		}
 
 		// 临时将 config.PackageFilter 设为 filterKey，以便后续逻辑使用
 		lo.config.PackageFilter = filterKey
 
-		packages, err = lo.discoverPackagesFromBinary(binData)
+		packages, err = lo.discoverPackagesFromBinary(data)
 		if err != nil {
 			return err
 		}
@@ -916,7 +1090,7 @@ func (lo *LinkerObfuscator) discoverAndGeneratePackageReplacements() error {
 	// 5. 如果启用第三方包混淆，发现并添加第三方包
 	var thirdPartyPackages []string
 	if lo.config.ObfuscateThirdParty && moduleName != "" {
-		thirdPartyPackages, err = lo.discoverThirdPartyPackages(moduleName)
+		thirdPartyPackages, err = lo.discoverThirdPartyPackages(moduleName, data)
 		if err != nil {
 			logger.Warnf("[!] 发现第三方包失败: %v", err)
 		} else {
@@ -1138,16 +1312,23 @@ func (lo *LinkerObfuscator) generateReplacements(packages []string) map[string]s
 	return replacements
 }
 
-// generateShortName 生成短名称 (a, b, c, ..., z, aa, ab, ...)
+// generateShortName 生成短名称 (a, b, c, ..., z, aa, ab, ..., zz, aaa, ...)
+// 使用双射 base-26 计数，可正确支持任意数量的包，避免超出 26^2 后
+// 生成 '{'、'|'、'~' 乃至高位字节等非法字符（破坏等长替换假设）。
 func (lo *LinkerObfuscator) generateShortName(index int) string {
-	if index < 26 {
-		return string(rune('a' + index))
+	if index < 0 {
+		index = 0
 	}
-
-	// 对于超过26的，使用两个字母
-	first := index/26 - 1
-	second := index % 26
-	return string(rune('a'+first)) + string(rune('a'+second))
+	var buf [16]byte
+	i := len(buf)
+	n := index + 1 // 双射计数从 1 开始（1->a, 26->z, 27->aa）
+	for n > 0 {
+		i--
+		n--
+		buf[i] = byte('a' + n%26)
+		n /= 26
+	}
+	return string(buf[i:])
 }
 
 // isSafeFunctionNamePrefix 检查是否是安全的函数名前缀位置
@@ -1202,12 +1383,13 @@ func (lo *LinkerObfuscator) isSafeFunctionNamePrefix(data []byte, pos int, patte
 }
 
 // discoverThirdPartyPackages 发现第三方依赖包
-func (lo *LinkerObfuscator) discoverThirdPartyPackages(moduleName string) ([]string, error) {
+func (lo *LinkerObfuscator) discoverThirdPartyPackages(moduleName string, data []byte) ([]string, error) {
 	packages := make(map[string]bool)
 
-	// 读取 go.mod 文件
+	// 读取 go.mod 文件（注意：用独立变量 goModData，避免遮蔽参数 data——后者是
+	// 二进制内容，需传给 discoverThirdPartySubPackages 用于枚举子包）。
 	goModPath := filepath.Join(lo.projectDir, "go.mod")
-	data, err := os.ReadFile(goModPath)
+	goModData, err := os.ReadFile(goModPath)
 	if err != nil {
 		return nil, err
 	}
@@ -1215,11 +1397,11 @@ func (lo *LinkerObfuscator) discoverThirdPartyPackages(moduleName string) ([]str
 	// 改进的正则表达式：匹配所有 require 行（包括 indirect 注释）
 	// 匹配格式: github.com/xxx/yyy v1.2.3 或 github.com/xxx/yyy v1.2.3 // indirect
 	requireRe := regexp.MustCompile(`(?m)^\s*([a-zA-Z0-9\-_\.]+/[a-zA-Z0-9\-_\./]+?)\s+v[^\s]+`)
-	requireMatches := requireRe.FindAllSubmatch(data, -1)
+	requireMatches := requireRe.FindAllSubmatch(goModData, -1)
 
 	// 同时匹配 replace 指令，格式: replace github.com/xxx/yyy => github.com/aaa/bbb v1.2.3
 	replaceRe := regexp.MustCompile(`(?m)^replace\s+([a-zA-Z0-9\-_\.]+/[a-zA-Z0-9\-_\./]+)\s+[^\n]*=>\s+([a-zA-Z0-9\-_\.]+/[a-zA-Z0-9\-_\./]+)\s+v`)
-	replaceMatches := replaceRe.FindAllSubmatch(data, -1)
+	replaceMatches := replaceRe.FindAllSubmatch(goModData, -1)
 
 	// 处理 require 的包
 	for _, match := range requireMatches {
@@ -1297,7 +1479,7 @@ func (lo *LinkerObfuscator) discoverThirdPartyPackages(moduleName string) ([]str
 	// golang.org/x/crypto/md4）并不在 require 中。若子包路径不在替换映射里，
 	// 其最后一段（types/descriptorpb/zapcore/md4）混淆后仍明文残留在 pclntab。
 	if lo.outputBin != "" {
-		if subs := lo.discoverThirdPartySubPackages(packages); len(subs) > 0 {
+		if subs := lo.discoverThirdPartySubPackages(packages, data); len(subs) > 0 {
 			logger.Infof("从二进制枚举到 %d 个第三方子包路径，合并进替换映射", len(subs))
 			for _, sp := range subs {
 				packages[sp] = true
@@ -1346,12 +1528,7 @@ func (lo *LinkerObfuscator) discoverThirdPartyPackages(moduleName string) ([]str
 // go.uber.org/zap/zapcore、golang.org/x/crypto/md4）并不在 require 中。若子包路径不在替换
 // 映射里，其最后一段（types/descriptorpb/zapcore/md4）混淆后仍明文残留在 pclntab。
 // 这里对每个以已知模块根开头的符号提取完整包路径（含各级子段），全部返回给调用方合并。
-func (lo *LinkerObfuscator) discoverThirdPartySubPackages(roots map[string]bool) []string {
-	data, err := os.ReadFile(lo.outputBin)
-	if err != nil {
-		return nil
-	}
-
+func (lo *LinkerObfuscator) discoverThirdPartySubPackages(roots map[string]bool, data []byte) []string {
 	rootList := make([]string, 0, len(roots))
 	for r := range roots {
 		if strings.Contains(r, "/") {
