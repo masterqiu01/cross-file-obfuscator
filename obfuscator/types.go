@@ -102,4 +102,5 @@ type LinkConfig struct {
 	DisablePclntab       bool              // 完全禁用 pclntab 修改（最安全）
 	PackageFilter        string            // 包名过滤关键字，只发现包含该字符串的包
 	ObfuscateFilePaths   bool              // 混淆二进制中包含 .go 的所有绝对/相对文件路径
+	ObfuscateBuildID     bool              // 清除 ELF 中的 Go/GNU build-id notes (file 的 "Go BuildID=" 字段)
 }

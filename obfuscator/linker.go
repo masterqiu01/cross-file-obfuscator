@@ -47,8 +47,9 @@ type LinkerObfuscator struct {
 func NewLinkerObfuscator(projectDir, outputBin string, config *LinkConfig) *LinkerObfuscator {
 	if config == nil {
 		config = &LinkConfig{
-			RemoveFuncNames: true, // 默认混淆函数名
-			EntryPackage:    ".",  // 默认当前目录
+			RemoveFuncNames:   true, // 默认混淆函数名
+			EntryPackage:      ".",  // 默认当前目录
+			ObfuscateBuildID:  true, // 默认清除 Go/GNU build-id notes
 		}
 	}
 	// 如果没有指定入口包，默认使用当前目录
@@ -138,6 +139,15 @@ func (lo *LinkerObfuscator) postProcessBinary(data []byte) error {
 	if biCount > 0 {
 		logger.Infof("[OK] 混淆了 %d 个 BuildInfo 元数据项", biCount)
 		modified = true
+	}
+
+	// 清除 ELF 中的 Go/GNU build-id notes，使 file 不再输出 "Go BuildID=..." 字段
+	if lo.config.ObfuscateBuildID {
+		bidCount := lo.obfuscateBuildIDs(data, format)
+		if bidCount > 0 {
+			logger.Infof("[OK] 清除了 %d 个 build-id note", bidCount)
+			modified = true
+		}
 	}
 
 	if modified {
@@ -247,6 +257,12 @@ func (lo *LinkerObfuscator) obfuscateBuildInfo(data []byte) int {
 	// 保留签名本身与结构分隔符（\t \x00 等），只替换内容。
 	// 若解析段表时已确认 __go_buildinfo/.go.buildinfo 段的边界，
 	// 严格限制在该段内扫描，防止越界改写后续 __DATA 数据导致程序崩溃。
+	//
+	// 若段表不可用（如二进制被 strip 掉 section header），无法通过 section
+	// 得知 buildinfo 边界，则按 buildinfo 自身的二进制结构（32 字节头部 +
+	// varint 前缀的长度字段 + 16 字节对齐，见 cmd/link/internal/ld/data.go
+	// 的 buildinfo()）解析出结束偏移，同样收紧扫描范围，避免 64KB 兜底上限
+	// 越界改写 .go.fipsinfo/.noptrdata/.data 等相邻数据导致程序启动崩溃。
 	const maxScan = 64 * 1024
 	end := idx + maxScan
 	if end > len(data) {
@@ -254,6 +270,11 @@ func (lo *LinkerObfuscator) obfuscateBuildInfo(data []byte) int {
 	}
 	if lo.buildInfoEnd > idx && end > lo.buildInfoEnd {
 		end = lo.buildInfoEnd
+	}
+	if lo.buildInfoEnd <= idx {
+		if be := findBuildInfoEnd(data, idx-2); be > idx && be < end {
+			end = be
+		}
 	}
 
 	nameGen := NewNaturalNameGenerator()
@@ -299,6 +320,54 @@ func (lo *LinkerObfuscator) obfuscateBuildInfo(data []byte) int {
 	count += lo.obfuscateBuildInfoCopies(data, idx, end)
 
 	return count
+}
+
+// findBuildInfoEnd 解析 Go buildinfo 的二进制结构，返回其结束偏移。
+// 布局来自 cmd/link/internal/ld/data.go 的 buildinfo()：
+//
+//	32 字节头部：\xff "Go buildinf:" + ptrSize + flags + 填充
+//	varint(版本串长度) + 版本串
+//	varint(modinfo 长度) + modinfo
+//	填充到 16 字节对齐
+//
+// 其中字符串统一用 varint 前缀的长度字段编码（appendString），与内容无关，
+// 因此即使 go1.24+ 的 modinfo 带 content hash 前缀也能正确解析。
+//
+// 只有 go1.18+ 的"指针无关格式"（flags 字节第 2 位为 1）才使用这种 32 字节头部 +
+// varint 编码；go1.16 及更早为 NUL 结尾字符串，无法在此可靠判定，返回 0 交由
+// 调用方走原有兜底逻辑（不影响旧版本原本的行为）。
+func findBuildInfoEnd(data []byte, sigPos int) int {
+	// go1.18+ 的 flags 字节只可能是 2（小端）或 3（大端）。限制在 <=3 能避免把
+	// go1.16/1.17 的格式误判：那类二进制 data[15] 是版本串首字符 'g'(0x67)，
+	// 0x67&2==2 会误入本分支。误判会导致解析出错误边界，故需显式排除。
+	if sigPos+16 > len(data) || data[sigPos+15] > 3 || data[sigPos+15]&2 == 0 {
+		return 0
+	}
+	pos := sigPos + 32
+	if pos > len(data) {
+		return 0
+	}
+	readStr := func() int {
+		n, ln := binary.Uvarint(data[pos:])
+		if ln <= 0 || n == 0 || uint64(len(data))-uint64(pos) < n {
+			return -1
+		}
+		return ln + int(n)
+	}
+	// 版本串
+	adv := readStr()
+	if adv < 0 {
+		return 0
+	}
+	pos += adv
+	// modinfo
+	adv = readStr()
+	if adv < 0 {
+		return 0
+	}
+	pos += adv
+	// 对齐到 16 字节
+	return (pos + 15) &^ 15
 }
 
 // obfuscateBuildInfoCopies 全局混淆 buildinfo 段之外的副本（如 __TEXT,__rodata）。
@@ -599,6 +668,12 @@ func (lo *LinkerObfuscator) processPclntabBinary(data []byte, candidates []pclnt
 
 // findPclntabMagic 在数据中查找 pclntab magic value（用 bytes.Index 快速定位，
 // 避免对超大文件逐字节扫描）。
+//
+// 全文件搜索时，代码段/数据段可能恰好包含与 magic 相同的字节序列（false positive），
+// 直接取第一个会出现错误偏移，导致混淆写入非 pclntab 区域、破坏二进制。这在二进制被
+// strip 掉 section header（如 "no section header"）时尤其常见，因为此时无法再借助
+// .gopclntab 等 section 定位。因此这里收集所有候选并校验 pcHeader 结构，只接受
+// 结构合法的候选；若没有合法候选，则回退到最早的原始匹配（兼容远古格式）。
 func findPclntabMagic(data []byte) int {
 	// 各 magic 值的小端字节序列
 	magics := [][]byte{
@@ -608,15 +683,57 @@ func findPclntabMagic(data []byte) int {
 		{0xf1, 0xff, 0xff, 0xff}, // go120magic
 	}
 
-	best := -1
+	best := -1      // 最早的原始匹配（回退用）
+	bestValid := -1 // 最早的通过头部校验的候选
 	for _, m := range magics {
-		if i := bytes.Index(data, m); i >= 0 {
-			if best < 0 || i < best {
-				best = i
+		for pos := 0; ; {
+			i := bytes.Index(data[pos:], m)
+			if i < 0 {
+				break
 			}
+			idx := pos + i
+			if best < 0 || idx < best {
+				best = idx
+			}
+			if isValidPclntabHeader(data, idx, m) {
+				if bestValid < 0 || idx < bestValid {
+					bestValid = idx
+				}
+			}
+			pos = idx + 1
 		}
 	}
+	if bestValid >= 0 {
+		return bestValid
+	}
 	return best
+}
+
+// isValidPclntabHeader 校验 pclntab 头部结构，排除代码/数据段中伪 magic（false
+// positive）。go1.16+ 的 pclntab 头部（runtime.pcHeader）前 12 字节布局为：
+//
+//	magic(4) pad1(1) pad2(1) minLC(1) ptrSize(1) nfunc(4)
+//
+// 其中 pad1/pad2 恒为 0，minLC（指令最小长度）∈ {1,2,4}，ptrSize ∈ {4,8}，
+// nfunc（函数数量）为合理值。代码段的随机字节几乎不可能同时满足这些条件。
+// go1.2（magic 0xFFFFFFFB）头部格式过于古老，无法可靠校验，一律视为不可信，
+// 由调用方回退到最早的原始匹配。
+func isValidPclntabHeader(data []byte, pos int, magic []byte) bool {
+	if pos+12 > len(data) {
+		return false
+	}
+	switch magic[0] {
+	case 0xfa, 0xf0, 0xf1: // go1.16 / go1.18 / go1.20+
+		pad1, pad2 := data[pos+4], data[pos+5]
+		minLC, ptrSize := data[pos+6], data[pos+7]
+		nfunc := binary.LittleEndian.Uint32(data[pos+8 : pos+12])
+		return pad1 == 0 && pad2 == 0 &&
+			(minLC == 1 || minLC == 2 || minLC == 4) &&
+			(ptrSize == 4 || ptrSize == 8) &&
+			nfunc > 0 && nfunc < 1<<24
+	default: // go1.2 等
+		return false
+	}
 }
 
 // modifyPclntab 原地修改 pclntab 的内容

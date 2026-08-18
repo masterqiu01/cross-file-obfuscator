@@ -81,6 +81,7 @@ func printUsage() {
 	fmt.Println("  -only-project               仅混淆项目自身包，保留标准库 (增强 Windows 兼容性)")
 	fmt.Println("  -disable-pclntab            仅执行基础符号操作，不修改 pclntab 结构")
 	fmt.Println("  -obfuscate-paths            混淆二进制中残留的 .go 源文件绝对路径 (默认: true, 极力推荐)")
+	fmt.Println("  -obfuscate-buildid          清除 Go/GNU build-id notes，去掉 file 输出的 'Go BuildID=' 字段 (默认: true)")
 	fmt.Println()
 	fmt.Println("\033[1m■ 全局选项:\033[0m")
 	fmt.Println("  -log-level string            日志级别 (debug/info/warn/error, 默认: info)")
@@ -171,6 +172,7 @@ func main() {
 		disablePclntab       = flag.Bool("disable-pclntab", false, "完全禁用 pclntab 修改")
 		packageFilter        = flag.String("pkg-filter", "", "包名过滤关键字")
 		obfuscatePaths       = flag.Bool("obfuscate-paths", true, "混淆二进制中残留的 .go 源文件绝对路径")
+		obfuscateBuildID     = flag.Bool("obfuscate-buildid", true, "清除二进制中的 Go/GNU build-id notes (去掉 file 的 'Go BuildID=' 字段)")
 		showHelp             = flag.Bool("h", false, "显示帮助信息")
 		logLevel             = flag.String("log-level", "info", "日志级别 (debug/info/warn/error)")
 	)
@@ -310,6 +312,7 @@ func main() {
 			DisablePclntab:       *disablePclntab,       // 完全禁用 pclntab
 			PackageFilter:        *packageFilter,        // 包名过滤关键字
 			ObfuscateFilePaths:   *obfuscatePaths,       // 混淆二进制中残留的 .go 源文件绝对路径
+			ObfuscateBuildID:     *obfuscateBuildID,     // 清除 Go/GNU build-id notes
 		}
 
 		// 验证无源码模式下的自动发现 (交由 linker.go 内部基于是否存在 go.mod 进行最终验证)
